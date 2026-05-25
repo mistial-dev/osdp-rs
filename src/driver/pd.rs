@@ -18,6 +18,8 @@ use crate::command::{Chlng, SCrypt};
 #[cfg(feature = "secure-channel")]
 use crate::packet::{Scb, ScsType};
 #[cfg(feature = "secure-channel")]
+use crate::reply::{Nak, NakErrorCode};
+#[cfg(feature = "secure-channel")]
 use crate::secure::{Disconnected, PdChallenged, Secure, SecureRandom, Session, frame};
 
 /// Trait for PD-side application logic. Each incoming command becomes a
@@ -445,9 +447,16 @@ impl<T: Transport, C: Clock, H: PdHandler, K: PdSecureKeyProvider> Pd<T, C, H, K
                         )?;
                         Ok(Some(bytes))
                     }
-                    Err((session, err)) => {
+                    Err((session, _err)) => {
                         self.secure_state = Some(PdSecureState::Disconnected(session));
-                        Err(Error::from(err))
+                        // OSDP v2.2 Annex D.1.3.4 permits NAK code 0x05 as
+                        // the failure response when the Server Cryptogram in
+                        // SCS_13 is not accepted.
+                        let bytes = self.encode_reply(
+                            sqn,
+                            &Reply::Nak(Nak::simple(NakErrorCode::SecurityBlockTypeNotSupported)),
+                        )?;
+                        Ok(Some(bytes))
                     }
                 }
             }
@@ -997,6 +1006,36 @@ mod tests {
         assert_eq!(parsed_rmac.scb.unwrap().data, &[1]);
         let rmac = RMacI::decode(parsed_rmac.data).unwrap();
         assert_eq!(rmac.r_mac_i, acu.initial_rmac());
+    }
+
+    #[cfg(feature = "secure-channel")]
+    #[test]
+    fn bad_scrypt_replies_with_scs14_failure_status() {
+        let config = secure_config();
+        let rnd_a = [0xA1; 8];
+
+        let chlng =
+            secure_command_packet(1, ScsType::Scs11, &Command::Chlng(Chlng::new(rnd_a))).unwrap();
+        let mut transport = VecTransport::new();
+        transport.feed(&chlng);
+        let mut pd = Pd::new(transport, MockClock::new(), 0x05, AlwaysAck)
+            .with_secure_channel(config, FixedPdKeys::scbk_only());
+        assert!(poll_once_with_test_rng(&mut pd).unwrap());
+        pd.transport().outgoing.clear();
+
+        let bad_scrypt =
+            secure_command_packet(2, ScsType::Scs13, &Command::SCrypt(SCrypt::new([0x55; 16])))
+                .unwrap();
+        pd.transport().feed(&bad_scrypt);
+        assert!(poll_once_with_test_rng(&mut pd).unwrap());
+
+        let failure_reply: Vec<u8> = pd.transport().outgoing.drain(..).collect();
+        let (parsed_failure, _) = ParsedPacket::parse(&failure_reply).unwrap();
+        assert!(parsed_failure.scb.is_none());
+        assert_eq!(parsed_failure.code, ReplyCode::Nak.as_byte());
+        let nak = Nak::decode(parsed_failure.data).unwrap();
+        assert_eq!(nak.error, NakErrorCode::SecurityBlockTypeNotSupported);
+        assert!(!pd.is_secure_session_established());
     }
 
     #[cfg(feature = "secure-channel")]

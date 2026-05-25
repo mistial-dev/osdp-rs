@@ -17,7 +17,7 @@ use crate::command::{Chlng, SCrypt};
 #[cfg(feature = "secure-channel")]
 use crate::packet::{Scb, ScsType};
 #[cfg(feature = "secure-channel")]
-use crate::reply::{CCrypt, RMacI};
+use crate::reply::{CCrypt, Nak, NakErrorCode, RMacI};
 #[cfg(feature = "secure-channel")]
 use crate::secure::{
     Challenged, Cryptogrammed, Disconnected, Secure, SecureRandom, Session, frame,
@@ -95,6 +95,15 @@ enum AcuSecureState {
 
 #[cfg(feature = "secure-channel")]
 const SCS14_STATUS_SUCCESS: [u8; 1] = [0x01];
+#[cfg(feature = "secure-channel")]
+const SCS14_STATUS_FAILURE: [u8; 1] = [0xff];
+
+#[cfg(feature = "secure-channel")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Scs14Status {
+    Success,
+    Failure,
+}
 
 /// Per-PD bookkeeping owned by the ACU driver.
 #[derive(Debug, Clone)]
@@ -417,7 +426,31 @@ impl<T: Transport, C: Clock> Acu<T, C> {
                 ));
             }
         };
-        self.require_scs14_success(scb.as_ref())?;
+        if reply_code == ReplyCode::Nak {
+            let nak = Nak::decode(&data)?;
+            if nak.error == NakErrorCode::SecurityBlockTypeNotSupported {
+                // OSDP v2.2 Annex D.1.3.4 allows a PD to report failed
+                // Server Cryptogram verification with NAK 0x05 instead of an
+                // SCS_14 failure status. Either form means SCS-CS failed.
+                pd.secure_state = None;
+                return Err(Error::Nak {
+                    code: nak.error.as_byte(),
+                });
+            }
+            pd.secure_state = Some(AcuSecureState::Cryptogrammed { session, key });
+            return Err(Error::Nak {
+                code: nak.error.as_byte(),
+            });
+        }
+        match self.require_scs14_status(scb.as_ref())? {
+            Scs14Status::Success => {}
+            Scs14Status::Failure => {
+                pd.secure_state = None;
+                return Err(Error::SecureSession(
+                    crate::error::SecureSessionError::BadCryptogram,
+                ));
+            }
+        }
         if reply_code != ReplyCode::RMacI {
             pd.secure_state = Some(AcuSecureState::Cryptogrammed { session, key });
             return Err(Error::UnknownReply(reply_code.as_byte()));
@@ -734,12 +767,19 @@ impl<T: Transport, C: Clock> Acu<T, C> {
     }
 
     #[cfg(feature = "secure-channel")]
-    fn require_scs14_success(&self, scb: Option<&Scb>) -> Result<(), Error> {
+    fn require_scs14_status(&self, scb: Option<&Scb>) -> Result<Scs14Status, Error> {
         match scb {
             // OSDP v2.2 Annex D.1.3.4 defines SCS_14 SEC_BLK_DATA[0] as a
             // status byte, not the SCS_11/SCS_13 key selector: 0x01 means
             // success and 0xff means the Server Cryptogram was rejected.
-            Some(scb) if scb.ty == ScsType::Scs14 && scb.data == SCS14_STATUS_SUCCESS => Ok(()),
+            // The crate PD emits the allowed NAK 0x05 alternative on failure,
+            // but ACU accepts both standard failure forms for interoperability.
+            Some(scb) if scb.ty == ScsType::Scs14 && scb.data == SCS14_STATUS_SUCCESS => {
+                Ok(Scs14Status::Success)
+            }
+            Some(scb) if scb.ty == ScsType::Scs14 && scb.data == SCS14_STATUS_FAILURE => {
+                Ok(Scs14Status::Failure)
+            }
             Some(scb) => Err(Error::BadSecurityBlock(scb.ty.as_byte())),
             None => Err(Error::SecureSession(
                 crate::error::SecureSessionError::NotSecure,
@@ -1250,6 +1290,86 @@ mod tests {
         ));
         assert!(!state.is_secure());
         assert!(acu.transport().writes.is_empty());
+    }
+
+    #[cfg(feature = "secure-channel")]
+    #[test]
+    fn receive_scs14_nak_failure_resets_secure_state() {
+        let mut acu = Acu::new(VecTransport::new(), MockClock::new());
+        let mut pd_driver = Pd::new(VecTransport::new(), MockClock::new(), 0x05, SecurePd)
+            .with_secure_channel(
+                PdSecureConfig { cuid: [0xC1; 8] },
+                FixedPdKeys::scbk_d_only(),
+            );
+        let mut state = PdState::default();
+        let mut keys = FixedAcuKeys(Some(scbk_d_material()));
+        let mut acu_rng = FixedRandom([0xA1; 8]);
+        let mut pd_rng = FixedRandom([0xB2; 8]);
+
+        acu.send_secure_challenge(0x05, &mut state, &mut keys, &mut acu_rng)
+            .unwrap();
+        acu.transport().shuffle_to(pd_driver.transport());
+        assert!(pd_driver.poll_once_with_rng(&mut pd_rng).unwrap());
+        pd_driver.transport().shuffle_to(acu.transport());
+        acu.receive_secure_ccrypt(&mut state).unwrap();
+
+        let failure = PacketBuilder::plain(
+            Address::reply(0x05).unwrap(),
+            ControlByte::new(state.next_sqn, CtrlFlags::USE_CRC),
+            ReplyCode::Nak.as_byte(),
+            Nak::simple(NakErrorCode::SecurityBlockTypeNotSupported)
+                .encode()
+                .unwrap(),
+        )
+        .encode()
+        .unwrap();
+        acu.transport().feed(&failure);
+
+        let err = acu.receive_secure_rmac_i(&mut state).unwrap_err();
+
+        assert!(matches!(err, Error::Nak { code: 0x05 }));
+        assert!(!state.is_secure());
+    }
+
+    #[cfg(feature = "secure-channel")]
+    #[test]
+    fn receive_scs14_status_failure_resets_secure_state() {
+        let mut acu = Acu::new(VecTransport::new(), MockClock::new());
+        let mut pd_driver = Pd::new(VecTransport::new(), MockClock::new(), 0x05, SecurePd)
+            .with_secure_channel(
+                PdSecureConfig { cuid: [0xC1; 8] },
+                FixedPdKeys::scbk_d_only(),
+            );
+        let mut state = PdState::default();
+        let mut keys = FixedAcuKeys(Some(scbk_d_material()));
+        let mut acu_rng = FixedRandom([0xA1; 8]);
+        let mut pd_rng = FixedRandom([0xB2; 8]);
+
+        acu.send_secure_challenge(0x05, &mut state, &mut keys, &mut acu_rng)
+            .unwrap();
+        acu.transport().shuffle_to(pd_driver.transport());
+        assert!(pd_driver.poll_once_with_rng(&mut pd_rng).unwrap());
+        pd_driver.transport().shuffle_to(acu.transport());
+        acu.receive_secure_ccrypt(&mut state).unwrap();
+
+        let failure = PacketBuilder {
+            addr: Address::reply(0x05).unwrap(),
+            ctrl: ControlByte::new(state.next_sqn, CtrlFlags::USE_CRC | CtrlFlags::HAS_SCB),
+            scb: Some(Scb::new(ScsType::Scs14, [0xff])),
+            code: ReplyCode::RMacI.as_byte(),
+            data: RMacI { r_mac_i: [0; 16] }.encode().unwrap(),
+        }
+        .encode()
+        .unwrap();
+        acu.transport().feed(&failure);
+
+        let err = acu.receive_secure_rmac_i(&mut state).unwrap_err();
+
+        assert!(matches!(
+            err,
+            Error::SecureSession(crate::error::SecureSessionError::BadCryptogram)
+        ));
+        assert!(!state.is_secure());
     }
 
     #[cfg(feature = "secure-channel")]
