@@ -114,6 +114,8 @@ pub struct Pd<T: Transport, C: Clock, H: PdHandler, K: PdSecureKeyProvider = NoP
     rx_buf: Vec<u8>,
     /// Last SQN we acted upon.
     last_sqn: Option<u8>,
+    /// Last accepted request frame (so duplicate secure SQNs can be authenticated by exact replay).
+    last_request: Option<Vec<u8>>,
     /// Last reply we sent (so we can repeat it on a duplicate SQN).
     last_reply: Option<Vec<u8>>,
     #[cfg(feature = "secure-channel")]
@@ -135,6 +137,7 @@ impl<T: Transport, C: Clock, H: PdHandler> Pd<T, C, H, NoPdSecureKeyProvider> {
             handler,
             rx_buf: Vec::with_capacity(crate::MAX_BUS_PACKET),
             last_sqn: None,
+            last_request: None,
             last_reply: None,
             #[cfg(feature = "secure-channel")]
             secure_config: None,
@@ -161,6 +164,7 @@ impl<T: Transport, C: Clock, H: PdHandler, K: PdSecureKeyProvider> Pd<T, C, H, K
             handler: self.handler,
             rx_buf: self.rx_buf,
             last_sqn: self.last_sqn,
+            last_request: self.last_request,
             last_reply: self.last_reply,
             secure_config: Some(config),
             secure_state: None,
@@ -225,18 +229,44 @@ impl<T: Transport, C: Clock, H: PdHandler, K: PdSecureKeyProvider> Pd<T, C, H, K
                     let cmd_data = parsed.data.to_vec();
                     #[cfg(feature = "secure-channel")]
                     let scb = parsed.scb.map(Scb::from);
-                    #[cfg(feature = "secure-channel")]
                     let raw_packet = self.rx_buf[..used].to_vec();
                     let used_len = used;
                     self.rx_buf.drain(..used_len);
 
                     if Some(sqn) == self.last_sqn {
-                        // ACU is asking for a reply repeat.
-                        if let Some(reply) = &self.last_reply {
-                            let r = reply.clone();
-                            self.transport.write_all(&r)?;
+                        #[cfg(feature = "secure-channel")]
+                        if self.is_secure_session_established() {
+                            if self.last_request.as_deref() == Some(raw_packet.as_slice()) {
+                                if let Some(reply) = &self.last_reply {
+                                    let r = reply.clone();
+                                    self.transport.write_all(&r)?;
+                                }
+                                return Ok(true);
+                            }
+                            self.reject_secure_duplicate(scb.as_ref(), &raw_packet)?;
+                            return Err(Error::SecureSession(
+                                crate::error::SecureSessionError::BadTransition,
+                            ));
+                        } else {
+                            // OSDP v2.2 §5.7/Table 2 asks the PD to repeat
+                            // its prior reply for a duplicate SQN. Before
+                            // SCS-CS completes, there is no secure MAC to
+                            // authenticate first.
+                            if let Some(reply) = &self.last_reply {
+                                let r = reply.clone();
+                                self.transport.write_all(&r)?;
+                            }
+                            return Ok(true);
                         }
-                        return Ok(true);
+                        #[cfg(not(feature = "secure-channel"))]
+                        {
+                            // ACU is asking for a reply repeat.
+                            if let Some(reply) = &self.last_reply {
+                                let r = reply.clone();
+                                self.transport.write_all(&r)?;
+                            }
+                            return Ok(true);
+                        }
                     }
 
                     #[cfg(feature = "secure-channel")]
@@ -249,6 +279,7 @@ impl<T: Transport, C: Clock, H: PdHandler, K: PdSecureKeyProvider> Pd<T, C, H, K
                     )? {
                         self.transport.write_all(&bytes)?;
                         self.last_sqn = Some(sqn);
+                        self.last_request = Some(raw_packet);
                         self.last_reply = Some(bytes);
                         let _ = self.clock.now_ms();
                         return Ok(true);
@@ -285,6 +316,7 @@ impl<T: Transport, C: Clock, H: PdHandler, K: PdSecureKeyProvider> Pd<T, C, H, K
                     let bytes = self.encode_reply(sqn, &reply)?;
                     self.transport.write_all(&bytes)?;
                     self.last_sqn = Some(sqn);
+                    self.last_request = Some(raw_packet);
                     self.last_reply = Some(bytes);
                     let _ = self.clock.now_ms();
                     return Ok(true);
@@ -494,6 +526,44 @@ impl<T: Transport, C: Clock, H: PdHandler, K: PdSecureKeyProvider> Pd<T, C, H, K
             Ok((session, plaintext)) => {
                 self.secure_state = Some(PdSecureState::Secure(session));
                 Ok(plaintext)
+            }
+            Err(err) => {
+                self.secure_state = Some(PdSecureState::Disconnected(err.session));
+                Err(err.error)
+            }
+        }
+    }
+
+    #[cfg(feature = "secure-channel")]
+    fn reject_secure_duplicate(&mut self, scb: Option<&Scb>, raw: &[u8]) -> Result<(), Error> {
+        match scb.map(|scb| scb.ty) {
+            Some(ScsType::Scs15 | ScsType::Scs17) => {}
+            _ => {
+                return Err(Error::SecureSession(
+                    crate::error::SecureSessionError::NotSecure,
+                ));
+            }
+        }
+
+        let state = match self.secure_state.as_ref() {
+            Some(PdSecureState::Secure(session)) => session.clone(),
+            _ => {
+                return Err(Error::SecureSession(
+                    crate::error::SecureSessionError::NotSecure,
+                ));
+            }
+        };
+        let (parsed, _) = ParsedPacket::parse(raw)?;
+        // OSDP v2.2 §5.7/Table 2 permits a duplicate SQN to replay the prior
+        // reply, but after SCS-CS Annex D.1.4/D.1.5 require secure messages
+        // with MACs. Only an exact replay of the last accepted secure frame can
+        // reuse the cached reply without advancing the MAC chain. Any other
+        // duplicate must authenticate before rejection; invalid MACs reset per
+        // Annex D.1.2.
+        match frame::unseal(state, &parsed, raw) {
+            Ok((session, _plaintext)) => {
+                self.secure_state = Some(PdSecureState::Disconnected(session.reset()));
+                Ok(())
             }
             Err(err) => {
                 self.secure_state = Some(PdSecureState::Disconnected(err.session));
@@ -1138,6 +1208,140 @@ mod tests {
         let reply =
             Reply::decode(ReplyCode::from_byte(parsed_reply.code).unwrap(), &plaintext).unwrap();
         assert!(matches!(reply, Reply::Ack(_)));
+    }
+
+    #[cfg(feature = "secure-channel")]
+    #[test]
+    fn secure_duplicate_exact_frame_replays_cached_reply_without_dispatch() {
+        struct CountHandler(Rc<Cell<u32>>);
+        impl PdHandler for CountHandler {
+            fn on_command(&mut self, _command: &Command) -> Reply {
+                self.0.set(self.0.get() + 1);
+                Reply::Ack(Ack)
+            }
+        }
+
+        let calls = Rc::new(Cell::new(0));
+        let (mut pd, mut acu) = secure_pd_with_acu(CountHandler(calls.clone()));
+        let secure_poll = seal(
+            &mut acu,
+            Address::pd(0x05).unwrap(),
+            Sqn::new(3).unwrap(),
+            Direction::AcuToPd,
+            false,
+            CommandCode::Poll.as_byte(),
+            &[],
+        )
+        .unwrap();
+
+        pd.transport().feed(&secure_poll);
+        assert!(poll_once_with_test_rng(&mut pd).unwrap());
+        let first_reply: Vec<u8> = pd.transport().outgoing.drain(..).collect();
+
+        pd.transport().feed(&secure_poll);
+        assert!(poll_once_with_test_rng(&mut pd).unwrap());
+        let replayed_reply: Vec<u8> = pd.transport().outgoing.drain(..).collect();
+
+        assert_eq!(calls.get(), 1);
+        assert_eq!(replayed_reply, first_reply);
+    }
+
+    #[cfg(feature = "secure-channel")]
+    #[test]
+    fn secure_duplicate_plaintext_is_rejected_without_replay() {
+        struct CountHandler(Rc<Cell<u32>>);
+        impl PdHandler for CountHandler {
+            fn on_command(&mut self, _command: &Command) -> Reply {
+                self.0.set(self.0.get() + 1);
+                Reply::Ack(Ack)
+            }
+        }
+
+        let calls = Rc::new(Cell::new(0));
+        let (mut pd, mut acu) = secure_pd_with_acu(CountHandler(calls.clone()));
+        let secure_poll = seal(
+            &mut acu,
+            Address::pd(0x05).unwrap(),
+            Sqn::new(3).unwrap(),
+            Direction::AcuToPd,
+            false,
+            CommandCode::Poll.as_byte(),
+            &[],
+        )
+        .unwrap();
+        pd.transport().feed(&secure_poll);
+        assert!(poll_once_with_test_rng(&mut pd).unwrap());
+        pd.transport().outgoing.clear();
+
+        let plaintext_duplicate = PacketBuilder::plain(
+            Address::pd(0x05).unwrap(),
+            ControlByte::new(Sqn::new(3).unwrap(), CtrlFlags::USE_CRC),
+            CommandCode::Poll.as_byte(),
+            Vec::new(),
+        )
+        .encode()
+        .unwrap();
+        pd.transport().feed(&plaintext_duplicate);
+        let err = poll_once_with_test_rng(&mut pd).unwrap_err();
+
+        assert!(matches!(
+            err,
+            Error::SecureSession(crate::error::SecureSessionError::NotSecure)
+        ));
+        assert_eq!(calls.get(), 1);
+        assert!(pd.transport().outgoing.is_empty());
+        assert!(pd.is_secure_session_established());
+    }
+
+    #[cfg(feature = "secure-channel")]
+    #[test]
+    fn secure_duplicate_bad_mac_resets_without_replay() {
+        struct CountHandler(Rc<Cell<u32>>);
+        impl PdHandler for CountHandler {
+            fn on_command(&mut self, _command: &Command) -> Reply {
+                self.0.set(self.0.get() + 1);
+                Reply::Ack(Ack)
+            }
+        }
+
+        let calls = Rc::new(Cell::new(0));
+        let (mut pd, mut acu) = secure_pd_with_acu(CountHandler(calls.clone()));
+        let secure_poll = seal(
+            &mut acu,
+            Address::pd(0x05).unwrap(),
+            Sqn::new(3).unwrap(),
+            Direction::AcuToPd,
+            false,
+            CommandCode::Poll.as_byte(),
+            &[],
+        )
+        .unwrap();
+        pd.transport().feed(&secure_poll);
+        assert!(poll_once_with_test_rng(&mut pd).unwrap());
+        pd.transport().outgoing.clear();
+
+        let bad_mac_duplicate = PacketBuilder {
+            addr: Address::pd(0x05).unwrap(),
+            ctrl: ControlByte::new(
+                Sqn::new(3).unwrap(),
+                CtrlFlags::USE_CRC | CtrlFlags::HAS_SCB,
+            ),
+            scb: Some(Scb::new(ScsType::Scs15, [])),
+            code: CommandCode::Poll.as_byte(),
+            data: Vec::new(),
+        }
+        .encode_with_mac(|_| [0; crate::packet::MAC_LEN])
+        .unwrap();
+        pd.transport().feed(&bad_mac_duplicate);
+        let err = poll_once_with_test_rng(&mut pd).unwrap_err();
+
+        assert!(matches!(
+            err,
+            Error::SecureSession(crate::error::SecureSessionError::BadCryptogram)
+        ));
+        assert_eq!(calls.get(), 1);
+        assert!(pd.transport().outgoing.is_empty());
+        assert!(!pd.is_secure_session_established());
     }
 
     #[cfg(feature = "secure-channel")]
