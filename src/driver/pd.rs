@@ -444,8 +444,8 @@ impl<T: Transport, C: Clock, H: PdHandler> Pd<T, C, H> {
 mod tests {
     use super::*;
     use crate::clock::MockClock;
-    use crate::command::{Command, Id};
-    use crate::reply::{Ack, PdId, Reply, ReplyCode};
+    use crate::command::{ComSet, Command, Id, KeySet};
+    use crate::reply::{Ack, Nak, NakErrorCode, PdId, Reply, ReplyCode};
     use crate::transport::VecTransport;
 
     #[cfg(feature = "secure-channel")]
@@ -457,7 +457,7 @@ mod tests {
     #[cfg(feature = "secure-channel")]
     use crate::secure::{SCBK_D, Secure, Session};
     #[cfg(feature = "secure-channel")]
-    use core::cell::Cell;
+    use core::cell::{Cell, RefCell};
     #[cfg(feature = "secure-channel")]
     use std::rc::Rc;
 
@@ -539,12 +539,27 @@ mod tests {
     fn secure_pd_with_acu<H: PdHandler>(
         handler: H,
     ) -> (Pd<VecTransport, MockClock, H>, Session<Secure>) {
+        secure_pd_with_acu_key(handler, PdSecureKey::Scbk, TEST_SCBK)
+    }
+
+    #[cfg(feature = "secure-channel")]
+    fn secure_pd_with_acu_key<H: PdHandler>(
+        handler: H,
+        key: PdSecureKey,
+        scbk: [u8; 16],
+    ) -> (Pd<VecTransport, MockClock, H>, Session<Secure>) {
         let config = secure_config();
         let rnd_a = [0xA1; 8];
-        let acu = Session::<Disconnected>::new(TEST_SCBK).challenge(rnd_a);
+        let acu = Session::<Disconnected>::new(scbk).challenge(rnd_a);
         let mut transport = VecTransport::new();
         transport.feed(
-            &secure_command_packet(1, ScsType::Scs11, &Command::Chlng(Chlng::new(rnd_a))).unwrap(),
+            &secure_command_packet_with_key(
+                1,
+                ScsType::Scs11,
+                key,
+                &Command::Chlng(Chlng::new(rnd_a)),
+            )
+            .unwrap(),
         );
         let mut pd =
             Pd::new(transport, MockClock::new(), 0x05, handler).with_secure_channel(config);
@@ -554,9 +569,10 @@ mod tests {
         let ccrypt = CCrypt::decode(parsed_ccrypt.data).unwrap();
         let acu = acu.receive_ccrypt(&ccrypt).unwrap();
 
-        let scrypt_packet = secure_command_packet(
+        let scrypt_packet = secure_command_packet_with_key(
             2,
             ScsType::Scs13,
+            key,
             &Command::SCrypt(SCrypt::new(acu.server_cryptogram())),
         )
         .unwrap();
@@ -590,6 +606,111 @@ mod tests {
         fn secure_channel_random(&mut self) -> Option<[u8; 8]> {
             Some(TEST_RND_B)
         }
+    }
+
+    #[cfg(feature = "secure-channel")]
+    #[derive(Debug, Default)]
+    struct InstallModeState {
+        install_mode: bool,
+        scbk: Option<[u8; 16]>,
+    }
+
+    #[cfg(feature = "secure-channel")]
+    #[derive(Clone)]
+    struct InstallModeHandler {
+        state: Rc<RefCell<InstallModeState>>,
+    }
+
+    #[cfg(feature = "secure-channel")]
+    impl InstallModeHandler {
+        fn new(state: Rc<RefCell<InstallModeState>>) -> Self {
+            state.borrow_mut().install_mode = true;
+            Self { state }
+        }
+    }
+
+    #[cfg(feature = "secure-channel")]
+    impl PdHandler for InstallModeHandler {
+        fn on_command(&mut self, command: &Command) -> Reply {
+            // OSDP v2.2 Annex D.2.1 permits KEYSET while the connection is
+            // secure or while a device is in a special installation setup
+            // mode, and says devices should exit that setup mode after a
+            // successful KEYSET. This test handler models that policy and
+            // keeps install mode limited to the setup commands exercised here.
+            if self.state.borrow().install_mode
+                && !matches!(
+                    command,
+                    Command::Id(_) | Command::ComSet(_) | Command::KeySet(_)
+                )
+            {
+                return Reply::Nak(Nak::simple(NakErrorCode::UnableToProcessCommandRecord));
+            }
+
+            match command {
+                Command::Id(_) => Reply::PdId(PdId {
+                    vendor_oui: [0x00, 0x06, 0x8E],
+                    model: 0x12,
+                    version: 0x34,
+                    serial: 0xCAFE_BABE,
+                    firmware: [1, 2, 3],
+                }),
+                Command::ComSet(_) => Reply::Ack(Ack),
+                Command::KeySet(keyset) if keyset.key_type == 0x01 && keyset.key.len() == 16 => {
+                    let mut scbk = [0u8; 16];
+                    scbk.copy_from_slice(&keyset.key);
+                    let mut state = self.state.borrow_mut();
+                    state.scbk = Some(scbk);
+                    state.install_mode = false;
+                    Reply::Ack(Ack)
+                }
+                Command::KeySet(_) => {
+                    Reply::Nak(Nak::simple(NakErrorCode::UnableToProcessCommandRecord))
+                }
+                _ => Reply::Ack(Ack),
+            }
+        }
+
+        fn secure_channel_key(&mut self, selection: PdSecureKey) -> Option<[u8; 16]> {
+            let state = self.state.borrow();
+            match selection {
+                PdSecureKey::Scbk => state.scbk,
+                PdSecureKey::ScbkD if state.install_mode => Some(SCBK_D),
+                PdSecureKey::ScbkD => None,
+            }
+        }
+
+        fn secure_channel_random(&mut self) -> Option<[u8; 8]> {
+            Some(TEST_RND_B)
+        }
+    }
+
+    #[cfg(feature = "secure-channel")]
+    fn exchange_secure_command<H: PdHandler>(
+        pd: &mut Pd<VecTransport, MockClock, H>,
+        mut acu: Session<Secure>,
+        sqn: u8,
+        command: &Command,
+    ) -> (Session<Secure>, Reply) {
+        let data = command.encode_data().unwrap();
+        let bytes = seal(
+            &mut acu,
+            Address::pd(0x05).unwrap(),
+            Sqn::new(sqn).unwrap(),
+            Direction::AcuToPd,
+            !data.is_empty(),
+            command.code().as_byte(),
+            &data,
+        )
+        .unwrap();
+        pd.transport().feed(&bytes);
+        assert!(pd.poll_once().unwrap());
+
+        let reply_bytes: Vec<u8> = pd.transport().outgoing.drain(..).collect();
+        let (parsed_reply, _) = ParsedPacket::parse(&reply_bytes).unwrap();
+        let (acu, plaintext) = unseal(acu, &parsed_reply, &reply_bytes).unwrap();
+        let reply =
+            Reply::decode(ReplyCode::from_byte(parsed_reply.code).unwrap(), &plaintext).unwrap();
+        (acu, reply)
     }
 
     #[cfg(feature = "secure-channel")]
@@ -934,5 +1055,93 @@ mod tests {
             Error::SecureSession(crate::error::SecureSessionError::NotSecure)
         ));
         assert!(!called.get());
+    }
+
+    #[cfg(feature = "secure-channel")]
+    #[test]
+    fn install_mode_limits_secure_commands_until_keyset() {
+        let state = Rc::new(RefCell::new(InstallModeState::default()));
+        let (mut pd, acu) = secure_pd_with_acu_key(
+            InstallModeHandler::new(state.clone()),
+            PdSecureKey::ScbkD,
+            SCBK_D,
+        );
+
+        let (acu, reply) =
+            exchange_secure_command(&mut pd, acu, 3, &Command::Poll(crate::command::Poll));
+        assert!(matches!(
+            reply,
+            Reply::Nak(Nak {
+                error: NakErrorCode::UnableToProcessCommandRecord,
+                ..
+            })
+        ));
+        assert!(state.borrow().install_mode);
+
+        let (_acu, reply) = exchange_secure_command(
+            &mut pd,
+            acu,
+            0,
+            &Command::ComSet(ComSet {
+                address: 0x05,
+                baud: 9600,
+            }),
+        );
+        assert!(matches!(reply, Reply::Ack(_)));
+        assert!(state.borrow().install_mode);
+    }
+
+    #[cfg(feature = "secure-channel")]
+    #[test]
+    fn keyset_installs_scbk_and_exits_install_mode() {
+        let installed_scbk = [0x5Au8; 16];
+        let state = Rc::new(RefCell::new(InstallModeState::default()));
+        let (mut pd, acu) = secure_pd_with_acu_key(
+            InstallModeHandler::new(state.clone()),
+            PdSecureKey::ScbkD,
+            SCBK_D,
+        );
+
+        let (_acu, reply) = exchange_secure_command(
+            &mut pd,
+            acu,
+            3,
+            &Command::KeySet(KeySet::scbk(installed_scbk)),
+        );
+        assert!(matches!(reply, Reply::Ack(_)));
+        assert_eq!(state.borrow().scbk, Some(installed_scbk));
+        assert!(!state.borrow().install_mode);
+
+        let rnd_a = [0xC3; 8];
+        let acu = Session::<Disconnected>::new(installed_scbk).challenge(rnd_a);
+        let chlng = secure_command_packet_with_key(
+            0,
+            ScsType::Scs11,
+            PdSecureKey::Scbk,
+            &Command::Chlng(Chlng::new(rnd_a)),
+        )
+        .unwrap();
+        pd.transport().feed(&chlng);
+        assert!(pd.poll_once().unwrap());
+        let ccrypt_reply: Vec<u8> = pd.transport().outgoing.drain(..).collect();
+        let (parsed_ccrypt, _) = ParsedPacket::parse(&ccrypt_reply).unwrap();
+        assert_eq!(parsed_ccrypt.scb.unwrap().data, &[1]);
+        let ccrypt = CCrypt::decode(parsed_ccrypt.data).unwrap();
+        let acu = acu.receive_ccrypt(&ccrypt).unwrap();
+
+        let scrypt = secure_command_packet_with_key(
+            1,
+            ScsType::Scs13,
+            PdSecureKey::Scbk,
+            &Command::SCrypt(SCrypt::new(acu.server_cryptogram())),
+        )
+        .unwrap();
+        pd.transport().feed(&scrypt);
+        assert!(pd.poll_once().unwrap());
+        let rmac_reply: Vec<u8> = pd.transport().outgoing.drain(..).collect();
+        let (parsed_rmac, _) = ParsedPacket::parse(&rmac_reply).unwrap();
+        assert_eq!(parsed_rmac.scb.unwrap().data, &[1]);
+        let rmac = RMacI::decode(parsed_rmac.data).unwrap();
+        assert_eq!(rmac.r_mac_i, acu.initial_rmac());
     }
 }
