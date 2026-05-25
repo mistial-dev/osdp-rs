@@ -575,16 +575,22 @@ impl<T: Transport, C: Clock> Acu<T, C> {
         let mut attempts: u8 = 0;
         let max = self.retry.max_retries;
         let budget = self.retry.overall_budget_ms;
+        let mut request: Option<Vec<u8>> = None;
 
         loop {
-            #[cfg(feature = "secure-channel")]
-            if pd.is_secure() {
-                self.send_secure_with_sqn(pd_addr, pd, sqn, command)?;
+            if let Some(bytes) = request.as_ref() {
+                self.transport.write_all(bytes)?;
             } else {
-                self.send_with_sqn(pd_addr, pd.use_crc, sqn, command)?;
+                #[cfg(feature = "secure-channel")]
+                let bytes = if pd.is_secure() {
+                    self.send_secure_with_sqn(pd_addr, pd, sqn, command)?
+                } else {
+                    self.send_with_sqn(pd_addr, pd.use_crc, sqn, command)?
+                };
+                #[cfg(not(feature = "secure-channel"))]
+                let bytes = self.send_with_sqn(pd_addr, pd.use_crc, sqn, command)?;
+                request = Some(bytes);
             }
-            #[cfg(not(feature = "secure-channel"))]
-            self.send_with_sqn(pd_addr, pd.use_crc, sqn, command)?;
 
             match self.recv_one_with_sqn(pd, sqn) {
                 Ok(reply) => {
@@ -1013,6 +1019,7 @@ mod tests {
         incoming: VecDeque<u8>,
         writes: Vec<Vec<u8>>,
         replies: Vec<Vec<u8>>,
+        drop_next_reply: bool,
     }
 
     #[cfg(feature = "secure-channel")]
@@ -1025,7 +1032,12 @@ mod tests {
                 incoming: VecDeque::new(),
                 writes: Vec::new(),
                 replies: Vec::new(),
+                drop_next_reply: false,
             }
+        }
+
+        fn drop_next_reply(&mut self) {
+            self.drop_next_reply = true;
         }
 
         fn last_write(&self) -> &[u8] {
@@ -1044,7 +1056,11 @@ mod tests {
             self.pd.transport().feed(bytes);
             self.pd.poll_once_with_rng(&mut self.rng)?;
             let reply: Vec<u8> = self.pd.transport().outgoing.drain(..).collect();
-            self.incoming.extend(reply.iter().copied());
+            if self.drop_next_reply {
+                self.drop_next_reply = false;
+            } else {
+                self.incoming.extend(reply.iter().copied());
+            }
             self.replies.push(reply);
             Ok(())
         }
@@ -1215,6 +1231,46 @@ mod tests {
             ]
         );
         assert!(parsed.mac.is_some());
+    }
+
+    #[cfg(feature = "secure-channel")]
+    #[test]
+    fn secure_exchange_retries_reuse_sealed_frame() {
+        let mut acu = Acu::new(LoopbackPdTransport::new(), MockClock::new());
+        acu.retry = RetryConfig {
+            max_retries: 1,
+            overall_budget_ms: 0,
+        };
+        let mut state = PdState::default();
+        let mut keys = FixedAcuKeys(Some(scbk_d_material()));
+        let mut rng = FixedRandom([0xA1; 8]);
+
+        acu.establish_secure_channel(0x05, &mut state, &mut keys, &mut rng)
+            .unwrap();
+
+        let first_exchange_write = acu.transport().writes.len();
+        acu.transport().drop_next_reply();
+        let outcome = acu
+            .exchange(0x05, &mut state, &Command::Poll(Poll))
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            ExchangeOutcome::Reply(Reply::Ack(crate::reply::Ack))
+        );
+        assert_eq!(state.next_sqn.value(), 3);
+        let writes = &acu.transport().writes;
+        assert_eq!(
+            writes[first_exchange_write],
+            writes[first_exchange_write + 1]
+        );
+
+        let outcome = acu
+            .exchange(0x05, &mut state, &Command::Id(Id::standard()))
+            .unwrap();
+
+        assert!(matches!(outcome, ExchangeOutcome::Reply(Reply::PdId(_))));
+        assert_eq!(state.next_sqn.value(), 1);
     }
 
     #[cfg(feature = "secure-channel")]
