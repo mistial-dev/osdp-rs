@@ -25,24 +25,73 @@ use crate::secure::{Disconnected, PdChallenged, Secure, Session, frame};
 pub trait PdHandler {
     /// Dispatch a fully-decoded command and return the reply payload.
     fn on_command(&mut self, command: &Command) -> Reply;
+
+    /// Return the SCBK requested by the secure-channel handshake.
+    ///
+    /// OSDP v2.2 Annex D.1.3.1 uses `SEC_BLK_DATA[0]` on SCS_11 to select
+    /// the current SCBK (`1`) or SCBK-D (`0`). Key ownership is application
+    /// state, so the PD driver asks the handler instead of storing keys.
+    #[cfg(feature = "secure-channel")]
+    fn secure_channel_key(&mut self, _selection: PdSecureKey) -> Option<[u8; 16]> {
+        None
+    }
+
+    /// Produce the PD random challenge `RND.B` for SCS_12.
+    ///
+    /// Annex D.1.3.2 requires the PD to generate this value. Tests may return
+    /// deterministic bytes; production handlers should use their platform RNG.
+    #[cfg(feature = "secure-channel")]
+    fn secure_channel_random(&mut self) -> Option<[u8; 8]> {
+        None
+    }
 }
 
-/// Static secure-channel material used by the PD handshake scaffold.
+/// Secure-channel key selector from SCS handshake `SEC_BLK_DATA[0]`.
+#[cfg(feature = "secure-channel")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PdSecureKey {
+    /// Current SCBK selected by `SEC_BLK_DATA[0] == 1`.
+    Scbk,
+    /// Installation default SCBK-D selected by `SEC_BLK_DATA[0] == 0`.
+    ScbkD,
+}
+
+#[cfg(feature = "secure-channel")]
+impl PdSecureKey {
+    fn from_scb_data(data: &[u8]) -> Result<Self, Error> {
+        match data {
+            [0] => Ok(Self::ScbkD),
+            [1] => Ok(Self::Scbk),
+            _ => Err(Error::MalformedPayload {
+                code: 0x76,
+                reason: "SCS handshake SEC_BLK_DATA must be exactly [0] or [1]",
+            }),
+        }
+    }
+
+    const fn as_scb_data(self) -> [u8; 1] {
+        match self {
+            Self::ScbkD => [0],
+            Self::Scbk => [1],
+        }
+    }
+}
+
+/// Static secure-channel identity used by the PD handshake.
 #[cfg(feature = "secure-channel")]
 #[derive(Debug, Clone, Copy)]
 pub struct PdSecureConfig {
-    /// Secure Channel Base Key selected by the caller.
-    pub scbk: [u8; 16],
     /// PD client identifier sent in `osdp_CCRYPT`.
     pub cuid: [u8; 8],
-    /// PD random number sent in `osdp_CCRYPT`.
-    pub rnd_b: [u8; 8],
 }
 
 #[cfg(feature = "secure-channel")]
 enum PdSecureState {
     Disconnected(Session<Disconnected>),
-    Challenged(Session<PdChallenged>),
+    Challenged {
+        session: Session<PdChallenged>,
+        key: PdSecureKey,
+    },
     Secure(Session<Secure>),
 }
 
@@ -90,7 +139,7 @@ impl<T: Transport, C: Clock, H: PdHandler> Pd<T, C, H> {
     #[cfg(feature = "secure-channel")]
     pub fn with_secure_channel(mut self, config: PdSecureConfig) -> Self {
         self.secure_config = Some(config);
-        self.secure_state = Some(PdSecureState::Disconnected(Session::new(config.scbk)));
+        self.secure_state = None;
         self
     }
 
@@ -125,7 +174,7 @@ impl<T: Transport, C: Clock, H: PdHandler> Pd<T, C, H> {
                     let sqn = parsed.ctrl.sqn.value();
                     let cmd_data = parsed.data.to_vec();
                     #[cfg(feature = "secure-channel")]
-                    let scb_ty = parsed.scb.map(|scb| scb.ty);
+                    let scb = parsed.scb.map(Scb::from);
                     #[cfg(feature = "secure-channel")]
                     let raw_packet = self.rx_buf[..used].to_vec();
                     let used_len = used;
@@ -142,7 +191,7 @@ impl<T: Transport, C: Clock, H: PdHandler> Pd<T, C, H> {
 
                     #[cfg(feature = "secure-channel")]
                     if let Some(bytes) =
-                        self.handle_secure_handshake(sqn, scb_ty, code, &cmd_data)?
+                        self.handle_secure_handshake(sqn, scb.as_ref(), code, &cmd_data)?
                     {
                         self.transport.write_all(&bytes)?;
                         self.last_sqn = Some(sqn);
@@ -154,7 +203,10 @@ impl<T: Transport, C: Clock, H: PdHandler> Pd<T, C, H> {
                     #[cfg(feature = "secure-channel")]
                     let cmd_data = {
                         let mut data = cmd_data;
-                        if matches!(scb_ty, Some(ScsType::Scs15 | ScsType::Scs17)) {
+                        if matches!(
+                            scb.as_ref().map(|scb| scb.ty),
+                            Some(ScsType::Scs15 | ScsType::Scs17)
+                        ) {
                             if let Some(plaintext) = self.unseal_secure_command(&raw_packet)? {
                                 data = plaintext;
                             }
@@ -255,62 +307,77 @@ impl<T: Transport, C: Clock, H: PdHandler> Pd<T, C, H> {
     fn handle_secure_handshake(
         &mut self,
         sqn: u8,
-        scb_ty: Option<ScsType>,
+        scb: Option<&Scb>,
         code: CommandCode,
         data: &[u8],
     ) -> Result<Option<Vec<u8>>, Error> {
-        match (scb_ty, code) {
+        match (scb.map(|scb| scb.ty), code) {
             (Some(ScsType::Scs11), CommandCode::Chlng) => {
                 let Some(config) = self.secure_config else {
                     return Ok(None);
                 };
-                let chlng = Chlng::decode(data)?;
-                let state = self
-                    .secure_state
-                    .take()
-                    .unwrap_or_else(|| PdSecureState::Disconnected(Session::new(config.scbk)));
-                let disconnected = match state {
-                    PdSecureState::Disconnected(session) => session,
-                    PdSecureState::Challenged(session) => session.reset(),
-                    PdSecureState::Secure(session) => session.reset(),
+                let key_selection = PdSecureKey::from_scb_data(&scb.unwrap().data)?;
+                let Some(scbk) = self.handler.secure_channel_key(key_selection) else {
+                    return Err(Error::MalformedPayload {
+                        code: 0x76,
+                        reason: "secure-channel key unavailable",
+                    });
                 };
-                let challenged =
-                    disconnected.receive_challenge(chlng.rnd_a, config.cuid, config.rnd_b);
+                let Some(rnd_b) = self.handler.secure_channel_random() else {
+                    return Err(Error::MalformedPayload {
+                        code: 0x76,
+                        reason: "secure-channel random unavailable",
+                    });
+                };
+                let chlng = Chlng::decode(data)?;
+                let _ = self.secure_state.take();
+                let disconnected = Session::new(scbk);
+                let challenged = disconnected.receive_challenge(chlng.rnd_a, config.cuid, rnd_b);
                 let ccrypt = challenged.ccrypt();
-                self.secure_state = Some(PdSecureState::Challenged(challenged));
+                self.secure_state = Some(PdSecureState::Challenged {
+                    session: challenged,
+                    key: key_selection,
+                });
                 let bytes = self.encode_reply_with_scb(
                     sqn,
-                    Scb::new(ScsType::Scs12, []),
+                    Scb::new(ScsType::Scs12, key_selection.as_scb_data()),
                     &Reply::CCrypt(ccrypt),
                 )?;
                 Ok(Some(bytes))
             }
             (Some(ScsType::Scs13), CommandCode::SCrypt) => {
-                let Some(config) = self.secure_config else {
+                if self.secure_config.is_none() {
                     return Ok(None);
                 };
+                let key_selection = PdSecureKey::from_scb_data(&scb.unwrap().data)?;
                 let scrypt = SCrypt::decode(data)?;
-                let state = self
-                    .secure_state
-                    .take()
-                    .unwrap_or_else(|| PdSecureState::Disconnected(Session::new(config.scbk)));
+                let state = self.secure_state.take();
                 let challenged = match state {
-                    PdSecureState::Challenged(session) => session,
-                    PdSecureState::Disconnected(session) => {
+                    Some(PdSecureState::Challenged { session, key }) if key == key_selection => {
+                        session
+                    }
+                    Some(PdSecureState::Challenged { session, .. }) => {
+                        self.secure_state = Some(PdSecureState::Disconnected(session.reset()));
+                        return Err(Error::SecureSession(
+                            crate::error::SecureSessionError::BadCryptogram,
+                        ));
+                    }
+                    Some(PdSecureState::Disconnected(session)) => {
                         self.secure_state = Some(PdSecureState::Disconnected(session));
                         return Ok(None);
                     }
-                    PdSecureState::Secure(session) => {
+                    Some(PdSecureState::Secure(session)) => {
                         self.secure_state = Some(PdSecureState::Secure(session));
                         return Ok(None);
                     }
+                    None => return Ok(None),
                 };
                 match challenged.receive_scrypt(&scrypt) {
                     Ok((secure, rmac_i)) => {
                         self.secure_state = Some(PdSecureState::Secure(secure));
                         let bytes = self.encode_reply_with_scb(
                             sqn,
-                            Scb::new(ScsType::Scs14, []),
+                            Scb::new(ScsType::Scs14, key_selection.as_scb_data()),
                             &Reply::RMacI(rmac_i),
                         )?;
                         Ok(Some(bytes))
@@ -370,10 +437,28 @@ mod tests {
     #[cfg(feature = "secure-channel")]
     use crate::secure::{SCBK_D, Secure, Session};
 
+    #[cfg(feature = "secure-channel")]
+    const TEST_SCBK: [u8; 16] = [0xA5; 16];
+    #[cfg(feature = "secure-channel")]
+    const TEST_RND_B: [u8; 8] = [0xB2; 8];
+
     struct AlwaysAck;
     impl PdHandler for AlwaysAck {
         fn on_command(&mut self, _command: &Command) -> Reply {
             Reply::Ack(Ack)
+        }
+
+        #[cfg(feature = "secure-channel")]
+        fn secure_channel_key(&mut self, selection: PdSecureKey) -> Option<[u8; 16]> {
+            match selection {
+                PdSecureKey::Scbk => Some(TEST_SCBK),
+                PdSecureKey::ScbkD => Some(SCBK_D),
+            }
+        }
+
+        #[cfg(feature = "secure-channel")]
+        fn secure_channel_random(&mut self) -> Option<[u8; 8]> {
+            Some(TEST_RND_B)
         }
     }
 
@@ -401,19 +486,25 @@ mod tests {
 
     #[cfg(feature = "secure-channel")]
     fn secure_config() -> PdSecureConfig {
-        PdSecureConfig {
-            scbk: SCBK_D,
-            cuid: [0xC1; 8],
-            rnd_b: [0xB2; 8],
-        }
+        PdSecureConfig { cuid: [0xC1; 8] }
     }
 
     #[cfg(feature = "secure-channel")]
     fn secure_command_packet(sqn: u8, scs: ScsType, command: &Command) -> Result<Vec<u8>, Error> {
+        secure_command_packet_with_key(sqn, scs, PdSecureKey::Scbk, command)
+    }
+
+    #[cfg(feature = "secure-channel")]
+    fn secure_command_packet_with_key(
+        sqn: u8,
+        scs: ScsType,
+        key: PdSecureKey,
+        command: &Command,
+    ) -> Result<Vec<u8>, Error> {
         PacketBuilder {
             addr: Address::pd(0x05)?,
             ctrl: ControlByte::new(Sqn::new(sqn)?, CtrlFlags::USE_CRC | CtrlFlags::HAS_SCB),
-            scb: Some(Scb::new(scs, [])),
+            scb: Some(Scb::new(scs, key.as_scb_data())),
             code: command.code().as_byte(),
             data: command.encode_data()?,
         }
@@ -436,11 +527,42 @@ mod tests {
         let reply_bytes: Vec<u8> = pd.transport().outgoing.drain(..).collect();
         let (parsed, _) = ParsedPacket::parse(&reply_bytes).unwrap();
         assert_eq!(parsed.scb.unwrap().ty, ScsType::Scs12);
+        assert_eq!(parsed.scb.unwrap().data, &[1]);
         assert_eq!(parsed.code, 0x76);
 
         let ccrypt = CCrypt::decode(parsed.data).unwrap();
-        let expected = Session::<Disconnected>::new(config.scbk)
-            .receive_challenge(rnd_a, config.cuid, config.rnd_b)
+        let expected = Session::<Disconnected>::new(TEST_SCBK)
+            .receive_challenge(rnd_a, config.cuid, TEST_RND_B)
+            .ccrypt();
+        assert_eq!(ccrypt, expected);
+    }
+
+    #[cfg(feature = "secure-channel")]
+    #[test]
+    fn secure_challenge_can_select_default_scbk() {
+        let config = secure_config();
+        let rnd_a = [0xA1; 8];
+        let bytes = secure_command_packet_with_key(
+            1,
+            ScsType::Scs11,
+            PdSecureKey::ScbkD,
+            &Command::Chlng(Chlng::new(rnd_a)),
+        )
+        .unwrap();
+        let mut transport = VecTransport::new();
+        transport.feed(&bytes);
+        let mut pd =
+            Pd::new(transport, MockClock::new(), 0x05, AlwaysAck).with_secure_channel(config);
+
+        assert!(pd.poll_once().unwrap());
+        let reply_bytes: Vec<u8> = pd.transport().outgoing.drain(..).collect();
+        let (parsed, _) = ParsedPacket::parse(&reply_bytes).unwrap();
+        assert_eq!(parsed.scb.unwrap().ty, ScsType::Scs12);
+        assert_eq!(parsed.scb.unwrap().data, &[0]);
+
+        let ccrypt = CCrypt::decode(parsed.data).unwrap();
+        let expected = Session::<Disconnected>::new(SCBK_D)
+            .receive_challenge(rnd_a, config.cuid, TEST_RND_B)
             .ccrypt();
         assert_eq!(ccrypt, expected);
     }
@@ -450,7 +572,7 @@ mod tests {
     fn secure_scrypt_replies_with_rmac_i() {
         let config = secure_config();
         let rnd_a = [0xA1; 8];
-        let acu = Session::<Disconnected>::new(config.scbk).challenge(rnd_a);
+        let acu = Session::<Disconnected>::new(TEST_SCBK).challenge(rnd_a);
 
         let chlng =
             secure_command_packet(1, ScsType::Scs11, &Command::Chlng(Chlng::new(rnd_a))).unwrap();
@@ -473,6 +595,7 @@ mod tests {
         let rmac_reply: Vec<u8> = pd.transport().outgoing.drain(..).collect();
         let (parsed_rmac, _) = ParsedPacket::parse(&rmac_reply).unwrap();
         assert_eq!(parsed_rmac.scb.unwrap().ty, ScsType::Scs14);
+        assert_eq!(parsed_rmac.scb.unwrap().data, &[1]);
         assert_eq!(parsed_rmac.code, 0x78);
 
         let rmac = RMacI::decode(parsed_rmac.data).unwrap();
@@ -486,6 +609,17 @@ mod tests {
         impl PdHandler for PanicHandler {
             fn on_command(&mut self, _command: &Command) -> Reply {
                 panic!("secure handshake must not reach PdHandler")
+            }
+
+            fn secure_channel_key(&mut self, selection: PdSecureKey) -> Option<[u8; 16]> {
+                match selection {
+                    PdSecureKey::Scbk => Some(TEST_SCBK),
+                    PdSecureKey::ScbkD => Some(SCBK_D),
+                }
+            }
+
+            fn secure_channel_random(&mut self) -> Option<[u8; 8]> {
+                Some(TEST_RND_B)
             }
         }
 
@@ -510,11 +644,22 @@ mod tests {
                 assert!(matches!(command, Command::Id(Id { reserved: 0 })));
                 Reply::Ack(Ack)
             }
+
+            fn secure_channel_key(&mut self, selection: PdSecureKey) -> Option<[u8; 16]> {
+                match selection {
+                    PdSecureKey::Scbk => Some(TEST_SCBK),
+                    PdSecureKey::ScbkD => Some(SCBK_D),
+                }
+            }
+
+            fn secure_channel_random(&mut self) -> Option<[u8; 8]> {
+                Some(TEST_RND_B)
+            }
         }
 
         let config = secure_config();
         let rnd_a = [0xA1; 8];
-        let acu = Session::<Disconnected>::new(config.scbk).challenge(rnd_a);
+        let acu = Session::<Disconnected>::new(TEST_SCBK).challenge(rnd_a);
         let mut transport = VecTransport::new();
         transport.feed(
             &secure_command_packet(1, ScsType::Scs11, &Command::Chlng(Chlng::new(rnd_a))).unwrap(),
@@ -577,11 +722,22 @@ mod tests {
                     firmware: [1, 2, 3],
                 })
             }
+
+            fn secure_channel_key(&mut self, selection: PdSecureKey) -> Option<[u8; 16]> {
+                match selection {
+                    PdSecureKey::Scbk => Some(TEST_SCBK),
+                    PdSecureKey::ScbkD => Some(SCBK_D),
+                }
+            }
+
+            fn secure_channel_random(&mut self) -> Option<[u8; 8]> {
+                Some(TEST_RND_B)
+            }
         }
 
         let config = secure_config();
         let rnd_a = [0xA1; 8];
-        let acu = Session::<Disconnected>::new(config.scbk).challenge(rnd_a);
+        let acu = Session::<Disconnected>::new(TEST_SCBK).challenge(rnd_a);
         let mut transport = VecTransport::new();
         transport.feed(
             &secure_command_packet(1, ScsType::Scs11, &Command::Chlng(Chlng::new(rnd_a))).unwrap(),
