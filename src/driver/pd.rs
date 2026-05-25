@@ -164,6 +164,9 @@ impl<T: Transport, C: Clock, H: PdHandler> Pd<T, C, H> {
 
                     let command = Command::decode(code, &cmd_data)?;
                     let reply = self.handler.on_command(&command);
+                    #[cfg(feature = "secure-channel")]
+                    let bytes = self.encode_reply_secure_if_established(sqn, &reply)?;
+                    #[cfg(not(feature = "secure-channel"))]
                     let bytes = self.encode_reply(sqn, &reply)?;
                     self.transport.write_all(&bytes)?;
                     self.last_sqn = Some(sqn);
@@ -195,6 +198,35 @@ impl<T: Transport, C: Clock, H: PdHandler> Pd<T, C, H> {
         );
         let data = reply.encode_data()?;
         PacketBuilder::plain(addr, ctrl, reply.code().as_byte(), data).encode()
+    }
+
+    #[cfg(feature = "secure-channel")]
+    fn encode_reply_secure_if_established(
+        &mut self,
+        sqn: u8,
+        reply: &Reply,
+    ) -> Result<Vec<u8>, Error> {
+        let state = match self.secure_state.take() {
+            Some(PdSecureState::Secure(session)) => session,
+            Some(state) => {
+                self.secure_state = Some(state);
+                return self.encode_reply(sqn, reply);
+            }
+            None => return self.encode_reply(sqn, reply),
+        };
+        let mut session = state;
+        let data = reply.encode_data()?;
+        let bytes = frame::seal(
+            &mut session,
+            Address::reply(self.address)?,
+            Sqn::new(sqn)?,
+            frame::Direction::PdToAcu,
+            !data.is_empty(),
+            reply.code().as_byte(),
+            &data,
+        )?;
+        self.secure_state = Some(PdSecureState::Secure(session));
+        Ok(bytes)
     }
 
     #[cfg(feature = "secure-channel")]
@@ -326,7 +358,7 @@ mod tests {
     use super::*;
     use crate::clock::MockClock;
     use crate::command::{Command, Id};
-    use crate::reply::{Ack, Reply};
+    use crate::reply::{Ack, PdId, Reply, ReplyCode};
     use crate::transport::VecTransport;
 
     #[cfg(feature = "secure-channel")]
@@ -334,9 +366,9 @@ mod tests {
     #[cfg(feature = "secure-channel")]
     use crate::reply::{CCrypt, RMacI};
     #[cfg(feature = "secure-channel")]
-    use crate::secure::frame::{Direction, seal};
+    use crate::secure::frame::{Direction, seal, unseal};
     #[cfg(feature = "secure-channel")]
-    use crate::secure::{SCBK_D, Session};
+    use crate::secure::{SCBK_D, Secure, Session};
 
     struct AlwaysAck;
     impl PdHandler for AlwaysAck {
@@ -520,5 +552,98 @@ mod tests {
         pd.transport().feed(&secure_id);
 
         assert!(pd.poll_once().unwrap());
+        let reply_bytes: Vec<u8> = pd.transport().outgoing.drain(..).collect();
+        let (parsed_reply, _) = ParsedPacket::parse(&reply_bytes).unwrap();
+        assert_eq!(parsed_reply.scb.unwrap().ty, ScsType::Scs16);
+        let (_acu, plaintext) = unseal(acu, &parsed_reply, &reply_bytes).unwrap();
+        assert!(plaintext.is_empty());
+        let reply =
+            Reply::decode(ReplyCode::from_byte(parsed_reply.code).unwrap(), &plaintext).unwrap();
+        assert!(matches!(reply, Reply::Ack(_)));
+    }
+
+    #[cfg(feature = "secure-channel")]
+    #[test]
+    fn secure_reply_data_is_encrypted_and_mac_protected() {
+        struct IdReply;
+        impl PdHandler for IdReply {
+            fn on_command(&mut self, command: &Command) -> Reply {
+                assert!(matches!(command, Command::Id(Id { reserved: 0 })));
+                Reply::PdId(PdId {
+                    vendor_oui: [0x00, 0x06, 0x8E],
+                    model: 0x12,
+                    version: 0x34,
+                    serial: 0xCAFE_BABE,
+                    firmware: [1, 2, 3],
+                })
+            }
+        }
+
+        let config = secure_config();
+        let rnd_a = [0xA1; 8];
+        let acu = Session::<Disconnected>::new(config.scbk).challenge(rnd_a);
+        let mut transport = VecTransport::new();
+        transport.feed(
+            &secure_command_packet(1, ScsType::Scs11, &Command::Chlng(Chlng::new(rnd_a))).unwrap(),
+        );
+        let mut pd =
+            Pd::new(transport, MockClock::new(), 0x05, IdReply).with_secure_channel(config);
+        assert!(pd.poll_once().unwrap());
+        let ccrypt_reply: Vec<u8> = pd.transport().outgoing.drain(..).collect();
+        let (parsed_ccrypt, _) = ParsedPacket::parse(&ccrypt_reply).unwrap();
+        let ccrypt = CCrypt::decode(parsed_ccrypt.data).unwrap();
+        let acu = acu.receive_ccrypt(&ccrypt).unwrap();
+
+        let scrypt_packet = secure_command_packet(
+            2,
+            ScsType::Scs13,
+            &Command::SCrypt(SCrypt::new(acu.server_cryptogram())),
+        )
+        .unwrap();
+        pd.transport().feed(&scrypt_packet);
+        assert!(pd.poll_once().unwrap());
+        pd.transport().outgoing.clear();
+        let rmac_i = acu.initial_rmac();
+        let mut acu: Session<Secure> = acu.confirm_rmac_i(&rmac_i).unwrap();
+
+        let secure_id = seal(
+            &mut acu,
+            Address::pd(0x05).unwrap(),
+            Sqn::new(3).unwrap(),
+            Direction::AcuToPd,
+            true,
+            CommandCode::Id.as_byte(),
+            &Id::standard().encode().unwrap(),
+        )
+        .unwrap();
+        pd.transport().feed(&secure_id);
+        assert!(pd.poll_once().unwrap());
+
+        let reply_bytes: Vec<u8> = pd.transport().outgoing.drain(..).collect();
+        let (parsed_reply, _) = ParsedPacket::parse(&reply_bytes).unwrap();
+        assert_eq!(parsed_reply.scb.unwrap().ty, ScsType::Scs18);
+        let expected_plaintext = PdId {
+            vendor_oui: [0x00, 0x06, 0x8E],
+            model: 0x12,
+            version: 0x34,
+            serial: 0xCAFE_BABE,
+            firmware: [1, 2, 3],
+        }
+        .encode()
+        .unwrap();
+        assert_ne!(parsed_reply.data, expected_plaintext.as_slice());
+
+        let (acu, plaintext) = unseal(acu, &parsed_reply, &reply_bytes).unwrap();
+        let reply =
+            Reply::decode(ReplyCode::from_byte(parsed_reply.code).unwrap(), &plaintext).unwrap();
+        assert!(matches!(
+            reply,
+            Reply::PdId(PdId {
+                vendor_oui: [0x00, 0x06, 0x8E],
+                serial: 0xCAFE_BABE,
+                ..
+            })
+        ));
+        let _ = acu;
     }
 }
