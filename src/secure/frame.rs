@@ -148,6 +148,15 @@ pub fn unseal(
             session: err.session,
             error: Error::from(err.error),
         })?;
+    if !scb.ty.is_encrypted() && !parsed.data.is_empty() {
+        // OSDP v2.2 Annex D.1.4.1/D.1.5 allow SCS_15/SCS_16 plaintext DATA
+        // only as a test mode. After authenticating the MAC, keep this
+        // high-level helper production-safe by rejecting unencrypted DATA.
+        return Err(UnsealError {
+            session: session.reset(),
+            error: Error::SecureSession(SecureSessionError::PlaintextDataNotAllowed),
+        });
+    }
     let plaintext = if scb.ty.is_encrypted() {
         match decrypt_data(&session.keys().s_enc, &decrypt_iv, parsed.data) {
             Ok(plaintext) => plaintext,
@@ -266,6 +275,36 @@ mod tests {
 
         assert!(matches!(
             err,
+            Error::SecureSession(SecureSessionError::PlaintextDataNotAllowed)
+        ));
+    }
+
+    #[test]
+    fn unseal_rejects_plaintext_data_in_mac_only_frame() {
+        let (mut acu, pd) = handshake_pair();
+        let builder = PacketBuilder {
+            addr: Address::pd(0x05).unwrap(),
+            ctrl: ControlByte::new(
+                Sqn::new(1).unwrap(),
+                CtrlFlags::USE_CRC | CtrlFlags::HAS_SCB,
+            ),
+            scb: Some(Scb::new(ScsType::Scs15, [])),
+            code: 0x6E,
+            data: b"plaintext command data".to_vec(),
+        };
+        let bytes = builder
+            .encode_with_mac(|bytes| {
+                let full = acu.mac(bytes);
+                let mut tag = [0u8; crate::packet::MAC_LEN];
+                tag.copy_from_slice(&full[..crate::packet::MAC_LEN]);
+                tag
+            })
+            .unwrap();
+
+        let (parsed, _used) = ParsedPacket::parse(&bytes).unwrap();
+        let err = unseal(pd, &parsed, &bytes).unwrap_err();
+        assert!(matches!(
+            err.error,
             Error::SecureSession(SecureSessionError::PlaintextDataNotAllowed)
         ));
     }
