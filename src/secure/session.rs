@@ -8,8 +8,10 @@
 //!
 //! See [`Session`] for the rendered state diagram.
 
+use crate::command::SCrypt;
 use crate::error::SecureSessionError;
 use crate::reply::CCrypt;
+use crate::reply::RMacI;
 use crate::secure::crypto::{SessionKeys, client_cryptogram, initial_rmac, server_cryptogram};
 use crate::secure::mac::cbc_mac;
 use core::marker::PhantomData;
@@ -25,6 +27,9 @@ pub struct Challenged;
 /// Phantom: ACU has verified CCRYPT and is awaiting RMAC_I.
 #[derive(Debug, Clone, Copy)]
 pub struct Cryptogrammed;
+/// Phantom: PD has received CHLNG and is awaiting SCRYPT.
+#[derive(Debug, Clone, Copy)]
+pub struct PdChallenged;
 /// Phantom: SC fully established.
 #[derive(Debug, Clone, Copy)]
 pub struct Secure;
@@ -147,6 +152,26 @@ impl Session<Disconnected> {
         self.rnd_a = rnd_a;
         self.transition()
     }
+
+    /// PD-side SCS_11 handling: capture `RND.A`, `cUID`, and `RND.B`, then
+    /// derive the session keys needed to emit `osdp_CCRYPT`.
+    ///
+    /// The caller selects SCBK vs SCBK-D by constructing this session with the
+    /// desired key, and supplies `RND.B` from its platform RNG.
+    ///
+    /// # Spec: OSDP v2.2 Annex D.1.3.2, D.4.3
+    pub fn receive_challenge(
+        mut self,
+        rnd_a: [u8; 8],
+        cuid: [u8; 8],
+        rnd_b: [u8; 8],
+    ) -> Session<PdChallenged> {
+        self.rnd_a = rnd_a;
+        self.cuid = cuid;
+        self.rnd_b = rnd_b;
+        self.keys = SessionKeys::derive(&self.scbk, &self.rnd_a);
+        self.transition()
+    }
 }
 
 impl Session<Challenged> {
@@ -192,6 +217,44 @@ impl Session<Cryptogrammed> {
         }
         self.last_their_mac = mine;
         Ok(self.transition())
+    }
+}
+
+impl Session<PdChallenged> {
+    /// Build the `osdp_CCRYPT` reply for SCS_12.
+    ///
+    /// # Spec: OSDP v2.2 Annex D.3.1, D.4.3
+    pub fn ccrypt(&self) -> CCrypt {
+        CCrypt {
+            cuid: self.cuid,
+            rnd_b: self.rnd_b,
+            client_cryptogram: client_cryptogram(&self.keys.s_enc, &self.rnd_a, &self.rnd_b),
+        }
+    }
+
+    /// Verify `osdp_SCRYPT` from SCS_13 and produce the `osdp_RMAC_I` reply
+    /// for SCS_14.
+    ///
+    /// On success, the returned secure session is seeded with the initial
+    /// R-MAC. On failure, derived keys are destroyed and the reset
+    /// [`Session<Disconnected>`] is returned.
+    ///
+    /// # Spec: OSDP v2.2 Annex D.1.3.4, D.3.2, D.4.4
+    pub fn receive_scrypt(
+        mut self,
+        scrypt: &SCrypt,
+    ) -> Result<(Session<Secure>, RMacI), (Session<Disconnected>, SecureSessionError)> {
+        let expected = server_cryptogram(&self.keys.s_enc, &self.rnd_a, &self.rnd_b);
+        if expected.ct_eq(&scrypt.server_cryptogram).unwrap_u8() == 0 {
+            return Err((self.reset(), SecureSessionError::BadCryptogram));
+        }
+        let r_mac_i = initial_rmac(
+            &self.keys.s_mac1,
+            &self.keys.s_mac2,
+            &scrypt.server_cryptogram,
+        );
+        self.last_their_mac = r_mac_i;
+        Ok((self.transition(), RMacI { r_mac_i }))
     }
 }
 
@@ -337,5 +400,64 @@ mod tests {
         };
         let err = session.receive_ccrypt(&ccrypt).unwrap_err();
         assert_eq!(err.1, SecureSessionError::BadCryptogram);
+    }
+
+    #[test]
+    fn pd_challenge_builds_ccrypt() {
+        let scbk = crate::secure::SCBK_D;
+        let rnd_a = [0x11u8; 8];
+        let rnd_b = [0x22u8; 8];
+        let cuid = [0x33u8; 8];
+        let pd = Session::<Disconnected>::new(scbk).receive_challenge(rnd_a, cuid, rnd_b);
+
+        let ccrypt = pd.ccrypt();
+        let keys = crate::secure::crypto::SessionKeys::derive(&scbk, &rnd_a);
+        assert_eq!(ccrypt.cuid, cuid);
+        assert_eq!(ccrypt.rnd_b, rnd_b);
+        assert_eq!(
+            ccrypt.client_cryptogram,
+            crate::secure::crypto::client_cryptogram(&keys.s_enc, &rnd_a, &rnd_b)
+        );
+    }
+
+    #[test]
+    fn pd_rejects_bad_server_cryptogram() {
+        let pd = Session::<Disconnected>::new(crate::secure::SCBK_D).receive_challenge(
+            [0x11u8; 8],
+            [0x22u8; 8],
+            [0x33u8; 8],
+        );
+        let bogus = SCrypt::new([0xFF; 16]);
+
+        let err = pd.receive_scrypt(&bogus).unwrap_err();
+        assert_eq!(err.1, SecureSessionError::BadCryptogram);
+        let _restart = err.0.challenge([0x44; 8]);
+    }
+
+    #[test]
+    fn pd_side_handshake_interoperates_with_acu_path() {
+        let scbk = crate::secure::SCBK_D;
+        let rnd_a = [0x11u8; 8];
+        let rnd_b = [0x22u8; 8];
+        let cuid = [0x33u8; 8];
+
+        let acu = Session::<Disconnected>::new(scbk).challenge(rnd_a);
+        let pd = Session::<Disconnected>::new(scbk).receive_challenge(rnd_a, cuid, rnd_b);
+        let ccrypt = pd.ccrypt();
+
+        let acu = acu.receive_ccrypt(&ccrypt).unwrap();
+        let scrypt = SCrypt::new(acu.server_cryptogram());
+        let (mut pd, rmac_i) = pd.receive_scrypt(&scrypt).unwrap();
+        let mut acu = acu.confirm_rmac_i(&rmac_i.r_mac_i).unwrap();
+
+        let acu_mac_full = acu.mac(b"first secure command");
+        let mut acu_mac = [0u8; crate::packet::MAC_LEN];
+        acu_mac.copy_from_slice(&acu_mac_full[..crate::packet::MAC_LEN]);
+        pd = pd.verify(b"first secure command", &acu_mac).unwrap();
+
+        let pd_mac_full = pd.mac(b"first secure reply");
+        let mut pd_mac = [0u8; crate::packet::MAC_LEN];
+        pd_mac.copy_from_slice(&pd_mac_full[..crate::packet::MAC_LEN]);
+        let _acu = acu.verify(b"first secure reply", &pd_mac).unwrap();
     }
 }

@@ -46,7 +46,7 @@ pub mod session;
 pub mod handshake {}
 
 pub use frame::{Direction, seal, unseal};
-pub use session::{Challenged, Cryptogrammed, Disconnected, Secure, Session};
+pub use session::{Challenged, Cryptogrammed, Disconnected, PdChallenged, Secure, Session};
 
 /// Default install key (`SCBK-D`): bytes `0x30..=0x3F`.
 ///
