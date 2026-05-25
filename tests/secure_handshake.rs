@@ -1,3 +1,5 @@
+#![cfg(feature = "secure-channel")]
+
 //! Annex D handshake walk-through.
 //!
 //! Drives the ACU and PD ends of the [`osdp::secure::Session`] type-state
