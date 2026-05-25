@@ -13,11 +13,20 @@ use osdp::command::{Command, Id, Poll};
 use osdp::driver::acu::{Acu, AcuSecureKey, PdState};
 use osdp::driver::pd::{Pd, PdHandler, PdSecureConfig, PdSecureKey};
 use osdp::reply::{Ack, PdId, Reply};
-use osdp::secure::SCBK_D;
+use osdp::secure::{SCBK_D, SecureRandom};
 use osdp::transport::{Transport, VecTransport};
 use std::collections::VecDeque;
 
 struct DemoPd;
+
+struct FixedRandom([u8; 8]);
+
+impl SecureRandom for FixedRandom {
+    fn fill_secure_random(&mut self, out: &mut [u8]) -> osdp::error::Result<()> {
+        out.copy_from_slice(&self.0);
+        Ok(())
+    }
+}
 
 impl PdHandler for DemoPd {
     fn on_command(&mut self, command: &Command) -> Reply {
@@ -39,14 +48,11 @@ impl PdHandler for DemoPd {
             PdSecureKey::Scbk => None,
         }
     }
-
-    fn secure_channel_random(&mut self) -> Option<[u8; 8]> {
-        Some([0xB2; 8])
-    }
 }
 
 struct LoopbackTransport {
     pd: Pd<VecTransport, SystemClock, DemoPd>,
+    rng: FixedRandom,
     incoming: VecDeque<u8>,
 }
 
@@ -55,6 +61,7 @@ impl LoopbackTransport {
         Self {
             pd: Pd::new(VecTransport::new(), SystemClock::new(), 0x05, DemoPd)
                 .with_secure_channel(PdSecureConfig { cuid: [0xC1; 8] }),
+            rng: FixedRandom([0xB2; 8]),
             incoming: VecDeque::new(),
         }
     }
@@ -63,7 +70,7 @@ impl LoopbackTransport {
 impl Transport for LoopbackTransport {
     fn write_all(&mut self, bytes: &[u8]) -> Result<(), Error> {
         self.pd.transport().feed(bytes);
-        self.pd.poll_once()?;
+        self.pd.poll_once_with_rng(&mut self.rng)?;
         self.incoming.extend(self.pd.transport().outgoing.drain(..));
         Ok(())
     }
@@ -80,8 +87,9 @@ impl Transport for LoopbackTransport {
 fn main() -> Result<(), Error> {
     let mut acu = Acu::new(LoopbackTransport::new(), SystemClock::new());
     let mut state = PdState::default();
+    let mut rng = FixedRandom([0xA1; 8]);
 
-    acu.establish_secure_channel(0x05, &mut state, AcuSecureKey::ScbkD, SCBK_D, [0xA1; 8])?;
+    acu.establish_secure_channel(0x05, &mut state, AcuSecureKey::ScbkD, SCBK_D, &mut rng)?;
     println!(
         "secure channel established; next SQN {}",
         state.next_sqn.value()

@@ -19,7 +19,9 @@ use crate::packet::{Scb, ScsType};
 #[cfg(feature = "secure-channel")]
 use crate::reply::{CCrypt, RMacI};
 #[cfg(feature = "secure-channel")]
-use crate::secure::{Challenged, Cryptogrammed, Disconnected, Secure, Session, frame};
+use crate::secure::{
+    Challenged, Cryptogrammed, Disconnected, Secure, SecureRandom, Session, frame,
+};
 #[cfg(not(feature = "secure-channel"))]
 type Scb = ();
 
@@ -280,14 +282,16 @@ impl<T: Transport, C: Clock> Acu<T, C> {
     /// OSDP v2.2 Annex D.1.3.1 uses `SEC_BLK_DATA[0]` to select the SCBK
     /// (`1`) or SCBK-D (`0`) for this secure-channel connection sequence.
     #[cfg(feature = "secure-channel")]
-    pub fn send_secure_challenge(
+    pub fn send_secure_challenge<R: SecureRandom>(
         &mut self,
         pd_addr: u8,
         pd: &mut PdState,
         key: AcuSecureKey,
         scbk: [u8; 16],
-        rnd_a: [u8; 8],
+        rng: &mut R,
     ) -> Result<Vec<u8>, Error> {
+        let mut rnd_a = [0u8; 8];
+        rng.fill_secure_random(&mut rnd_a)?;
         let session = Session::<Disconnected>::new(scbk).challenge(rnd_a);
         let bytes = self.send_secure_handshake_with_sqn(
             pd_addr,
@@ -402,15 +406,15 @@ impl<T: Transport, C: Clock> Acu<T, C> {
     /// the individual steps directly. OSDP v2.2 Annex D.1.3 defines this
     /// order: CHLNG, CCRYPT, SCRYPT, then RMAC_I.
     #[cfg(feature = "secure-channel")]
-    pub fn establish_secure_channel(
+    pub fn establish_secure_channel<R: SecureRandom>(
         &mut self,
         pd_addr: u8,
         pd: &mut PdState,
         key: AcuSecureKey,
         scbk: [u8; 16],
-        rnd_a: [u8; 8],
+        rng: &mut R,
     ) -> Result<(), Error> {
-        self.send_secure_challenge(pd_addr, pd, key, scbk, rnd_a)?;
+        self.send_secure_challenge(pd_addr, pd, key, scbk, rng)?;
         self.receive_secure_ccrypt(pd)?;
         self.send_secure_scrypt(pd_addr, pd)?;
         self.receive_secure_rmac_i(pd)
@@ -717,6 +721,18 @@ mod tests {
     #[cfg(feature = "secure-channel")]
     use alloc::collections::VecDeque;
 
+    #[cfg(feature = "secure-channel")]
+    struct FixedRandom([u8; 8]);
+
+    #[cfg(feature = "secure-channel")]
+    impl SecureRandom for FixedRandom {
+        fn fill_secure_random(&mut self, out: &mut [u8]) -> crate::error::Result<()> {
+            assert_eq!(out.len(), self.0.len());
+            out.copy_from_slice(&self.0);
+            Ok(())
+        }
+    }
+
     #[test]
     fn send_poll_emits_correct_bytes() {
         let clock = MockClock::new();
@@ -849,27 +865,25 @@ mod tests {
                     PdSecureKey::Scbk => None,
                 }
             }
-
-            fn secure_channel_random(&mut self) -> Option<[u8; 8]> {
-                Some([0xB2; 8])
-            }
         }
 
         let mut acu = Acu::new(VecTransport::new(), MockClock::new());
         let mut pd_driver = Pd::new(VecTransport::new(), MockClock::new(), 0x05, SecurePd)
             .with_secure_channel(PdSecureConfig { cuid: [0xC1; 8] });
         let mut state = PdState::default();
+        let mut acu_rng = FixedRandom([0xA1; 8]);
+        let mut pd_rng = FixedRandom([0xB2; 8]);
 
-        acu.send_secure_challenge(0x05, &mut state, AcuSecureKey::ScbkD, SCBK_D, [0xA1; 8])
+        acu.send_secure_challenge(0x05, &mut state, AcuSecureKey::ScbkD, SCBK_D, &mut acu_rng)
             .unwrap();
         acu.transport().shuffle_to(pd_driver.transport());
-        assert!(pd_driver.poll_once().unwrap());
+        assert!(pd_driver.poll_once_with_rng(&mut pd_rng).unwrap());
         pd_driver.transport().shuffle_to(acu.transport());
         acu.receive_secure_ccrypt(&mut state).unwrap();
 
         acu.send_secure_scrypt(0x05, &mut state).unwrap();
         acu.transport().shuffle_to(pd_driver.transport());
-        assert!(pd_driver.poll_once().unwrap());
+        assert!(pd_driver.poll_once_with_rng(&mut pd_rng).unwrap());
         pd_driver.transport().shuffle_to(acu.transport());
         acu.receive_secure_rmac_i(&mut state).unwrap();
 
@@ -901,15 +915,12 @@ mod tests {
                 PdSecureKey::Scbk => None,
             }
         }
-
-        fn secure_channel_random(&mut self) -> Option<[u8; 8]> {
-            Some([0xB2; 8])
-        }
     }
 
     #[cfg(feature = "secure-channel")]
     struct LoopbackPdTransport {
         pd: Pd<VecTransport, MockClock, SecurePd>,
+        rng: FixedRandom,
         incoming: VecDeque<u8>,
         writes: Vec<Vec<u8>>,
         replies: Vec<Vec<u8>>,
@@ -921,6 +932,7 @@ mod tests {
             Self {
                 pd: Pd::new(VecTransport::new(), MockClock::new(), 0x05, SecurePd)
                     .with_secure_channel(PdSecureConfig { cuid: [0xC1; 8] }),
+                rng: FixedRandom([0xB2; 8]),
                 incoming: VecDeque::new(),
                 writes: Vec::new(),
                 replies: Vec::new(),
@@ -941,7 +953,7 @@ mod tests {
         fn write_all(&mut self, bytes: &[u8]) -> Result<(), Error> {
             self.writes.push(bytes.to_vec());
             self.pd.transport().feed(bytes);
-            self.pd.poll_once()?;
+            self.pd.poll_once_with_rng(&mut self.rng)?;
             let reply: Vec<u8> = self.pd.transport().outgoing.drain(..).collect();
             self.incoming.extend(reply.iter().copied());
             self.replies.push(reply);
@@ -961,8 +973,9 @@ mod tests {
     fn establish_secure_state() -> PdState {
         let mut acu = Acu::new(LoopbackPdTransport::new(), MockClock::new());
         let mut state = PdState::default();
+        let mut rng = FixedRandom([0xA1; 8]);
 
-        acu.establish_secure_channel(0x05, &mut state, AcuSecureKey::ScbkD, SCBK_D, [0xA1; 8])
+        acu.establish_secure_channel(0x05, &mut state, AcuSecureKey::ScbkD, SCBK_D, &mut rng)
             .unwrap();
 
         assert!(state.is_secure());
@@ -974,8 +987,9 @@ mod tests {
     fn establish_secure_channel_runs_full_handshake() {
         let mut acu = Acu::new(LoopbackPdTransport::new(), MockClock::new());
         let mut state = PdState::default();
+        let mut rng = FixedRandom([0xA1; 8]);
 
-        acu.establish_secure_channel(0x05, &mut state, AcuSecureKey::ScbkD, SCBK_D, [0xA1; 8])
+        acu.establish_secure_channel(0x05, &mut state, AcuSecureKey::ScbkD, SCBK_D, &mut rng)
             .unwrap();
 
         assert!(state.is_secure());
@@ -998,8 +1012,9 @@ mod tests {
             overall_budget_ms: 0,
         };
         let mut state = PdState::default();
+        let mut rng = FixedRandom([0xA1; 8]);
 
-        acu.establish_secure_channel(0x05, &mut state, AcuSecureKey::ScbkD, SCBK_D, [0xA1; 8])
+        acu.establish_secure_channel(0x05, &mut state, AcuSecureKey::ScbkD, SCBK_D, &mut rng)
             .unwrap();
 
         let outcome = acu
@@ -1027,8 +1042,9 @@ mod tests {
             overall_budget_ms: 0,
         };
         let mut state = PdState::default();
+        let mut rng = FixedRandom([0xA1; 8]);
 
-        acu.establish_secure_channel(0x05, &mut state, AcuSecureKey::ScbkD, SCBK_D, [0xA1; 8])
+        acu.establish_secure_channel(0x05, &mut state, AcuSecureKey::ScbkD, SCBK_D, &mut rng)
             .unwrap();
 
         let outcome = acu

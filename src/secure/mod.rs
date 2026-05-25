@@ -48,6 +48,16 @@ pub mod handshake {}
 pub use frame::{Direction, seal, unseal};
 pub use session::{Challenged, Cryptogrammed, Disconnected, PdChallenged, Secure, Session};
 
+/// Source of cryptographic-quality random bytes for secure-channel handshakes.
+///
+/// Drivers borrow this at the call site instead of owning it, which fits
+/// embedded/RTIC resource ownership: a task can lock a TRNG/DRBG peripheral,
+/// fill the OSDP challenge bytes, then release the resource.
+pub trait SecureRandom {
+    /// Fill `out` with cryptographically secure random bytes.
+    fn fill_secure_random(&mut self, out: &mut [u8]) -> crate::error::Result<()>;
+}
+
 /// Default install key (`SCBK-D`): bytes `0x30..=0x3F`.
 ///
 /// # Spec: Annex D.8

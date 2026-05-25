@@ -18,7 +18,7 @@ use crate::command::{Chlng, SCrypt};
 #[cfg(feature = "secure-channel")]
 use crate::packet::{Scb, ScsType};
 #[cfg(feature = "secure-channel")]
-use crate::secure::{Disconnected, PdChallenged, Secure, Session, frame};
+use crate::secure::{Disconnected, PdChallenged, Secure, SecureRandom, Session, frame};
 
 /// Trait for PD-side application logic. Each incoming command becomes a
 /// method call; the handler returns the reply to emit.
@@ -33,15 +33,6 @@ pub trait PdHandler {
     /// state, so the PD driver asks the handler instead of storing keys.
     #[cfg(feature = "secure-channel")]
     fn secure_channel_key(&mut self, _selection: PdSecureKey) -> Option<[u8; 16]> {
-        None
-    }
-
-    /// Produce the PD random challenge `RND.B` for SCS_12.
-    ///
-    /// Annex D.1.3.2 requires the PD to generate this value. Tests may return
-    /// deterministic bytes; production handlers should use their platform RNG.
-    #[cfg(feature = "secure-channel")]
-    fn secure_channel_random(&mut self) -> Option<[u8; 8]> {
         None
     }
 }
@@ -154,6 +145,31 @@ impl<T: Transport, C: Clock, H: PdHandler> Pd<T, C, H> {
     /// Returns `Ok(true)` if a packet was processed, `Ok(false)` if more
     /// bytes are required.
     pub fn poll_once(&mut self) -> Result<bool, Error> {
+        #[cfg(feature = "secure-channel")]
+        {
+            self.poll_once_inner(None)
+        }
+        #[cfg(not(feature = "secure-channel"))]
+        {
+            self.poll_once_inner()
+        }
+    }
+
+    /// Like [`Self::poll_once`], but supplies a cryptographic random source
+    /// for secure-channel handshakes.
+    ///
+    /// OSDP v2.2 Annex D.1.3.2 requires the PD to generate `RND.B` for
+    /// SCS_12. Borrowing the RNG at the call site keeps the driver compatible
+    /// with embedded/RTIC resource ownership.
+    #[cfg(feature = "secure-channel")]
+    pub fn poll_once_with_rng<R: SecureRandom>(&mut self, rng: &mut R) -> Result<bool, Error> {
+        self.poll_once_inner(Some(rng))
+    }
+
+    fn poll_once_inner(
+        &mut self,
+        #[cfg(feature = "secure-channel")] mut rng: Option<&mut dyn SecureRandom>,
+    ) -> Result<bool, Error> {
         let mut tmp = [0u8; 64];
         let n = self.transport.read(&mut tmp)?;
         if n > 0 {
@@ -190,9 +206,13 @@ impl<T: Transport, C: Clock, H: PdHandler> Pd<T, C, H> {
                     }
 
                     #[cfg(feature = "secure-channel")]
-                    if let Some(bytes) =
-                        self.handle_secure_handshake(sqn, scb.as_ref(), code, &cmd_data)?
-                    {
+                    if let Some(bytes) = self.handle_secure_handshake(
+                        sqn,
+                        scb.as_ref(),
+                        code,
+                        &cmd_data,
+                        rng.take(),
+                    )? {
                         self.transport.write_all(&bytes)?;
                         self.last_sqn = Some(sqn);
                         self.last_reply = Some(bytes);
@@ -319,6 +339,7 @@ impl<T: Transport, C: Clock, H: PdHandler> Pd<T, C, H> {
         scb: Option<&Scb>,
         code: CommandCode,
         data: &[u8],
+        rng: Option<&mut dyn SecureRandom>,
     ) -> Result<Option<Vec<u8>>, Error> {
         match (scb.map(|scb| scb.ty), code) {
             (Some(ScsType::Scs11), CommandCode::Chlng) => {
@@ -332,12 +353,11 @@ impl<T: Transport, C: Clock, H: PdHandler> Pd<T, C, H> {
                         reason: "secure-channel key unavailable",
                     });
                 };
-                let Some(rnd_b) = self.handler.secure_channel_random() else {
-                    return Err(Error::MalformedPayload {
-                        code: 0x76,
-                        reason: "secure-channel random unavailable",
-                    });
+                let Some(rng) = rng else {
+                    return Err(Error::Io("secure-channel random unavailable"));
                 };
+                let mut rnd_b = [0u8; 8];
+                rng.fill_secure_random(&mut rnd_b)?;
                 let chlng = Chlng::decode(data)?;
                 let _ = self.secure_state.take();
                 let disconnected = Session::new(scbk);
@@ -455,7 +475,7 @@ mod tests {
     #[cfg(feature = "secure-channel")]
     use crate::secure::frame::{Direction, seal, unseal};
     #[cfg(feature = "secure-channel")]
-    use crate::secure::{SCBK_D, Secure, Session};
+    use crate::secure::{SCBK_D, Secure, SecureRandom, Session};
     #[cfg(feature = "secure-channel")]
     use core::cell::{Cell, RefCell};
     #[cfg(feature = "secure-channel")]
@@ -465,6 +485,26 @@ mod tests {
     const TEST_SCBK: [u8; 16] = [0xA5; 16];
     #[cfg(feature = "secure-channel")]
     const TEST_RND_B: [u8; 8] = [0xB2; 8];
+
+    #[cfg(feature = "secure-channel")]
+    struct FixedRandom([u8; 8]);
+
+    #[cfg(feature = "secure-channel")]
+    impl SecureRandom for FixedRandom {
+        fn fill_secure_random(&mut self, out: &mut [u8]) -> crate::error::Result<()> {
+            assert_eq!(out.len(), self.0.len());
+            out.copy_from_slice(&self.0);
+            Ok(())
+        }
+    }
+
+    #[cfg(feature = "secure-channel")]
+    fn poll_once_with_test_rng<T: Transport, C: Clock, H: PdHandler>(
+        pd: &mut Pd<T, C, H>,
+    ) -> Result<bool, Error> {
+        let mut rng = FixedRandom(TEST_RND_B);
+        pd.poll_once_with_rng(&mut rng)
+    }
 
     struct AlwaysAck;
     impl PdHandler for AlwaysAck {
@@ -478,11 +518,6 @@ mod tests {
                 PdSecureKey::Scbk => Some(TEST_SCBK),
                 PdSecureKey::ScbkD => Some(SCBK_D),
             }
-        }
-
-        #[cfg(feature = "secure-channel")]
-        fn secure_channel_random(&mut self) -> Option<[u8; 8]> {
-            Some(TEST_RND_B)
         }
     }
 
@@ -563,7 +598,7 @@ mod tests {
         );
         let mut pd =
             Pd::new(transport, MockClock::new(), 0x05, handler).with_secure_channel(config);
-        assert!(pd.poll_once().unwrap());
+        assert!(poll_once_with_test_rng(&mut pd).unwrap());
         let ccrypt_reply: Vec<u8> = pd.transport().outgoing.drain(..).collect();
         let (parsed_ccrypt, _) = ParsedPacket::parse(&ccrypt_reply).unwrap();
         let ccrypt = CCrypt::decode(parsed_ccrypt.data).unwrap();
@@ -577,7 +612,7 @@ mod tests {
         )
         .unwrap();
         pd.transport().feed(&scrypt_packet);
-        assert!(pd.poll_once().unwrap());
+        assert!(poll_once_with_test_rng(&mut pd).unwrap());
         pd.transport().outgoing.clear();
         let rmac_i = acu.initial_rmac();
         let acu = acu.confirm_rmac_i(&rmac_i).unwrap();
@@ -601,10 +636,6 @@ mod tests {
                 PdSecureKey::Scbk => Some(TEST_SCBK),
                 PdSecureKey::ScbkD => Some(SCBK_D),
             }
-        }
-
-        fn secure_channel_random(&mut self) -> Option<[u8; 8]> {
-            Some(TEST_RND_B)
         }
     }
 
@@ -678,10 +709,6 @@ mod tests {
                 PdSecureKey::ScbkD => None,
             }
         }
-
-        fn secure_channel_random(&mut self) -> Option<[u8; 8]> {
-            Some(TEST_RND_B)
-        }
     }
 
     #[cfg(feature = "secure-channel")]
@@ -703,7 +730,7 @@ mod tests {
         )
         .unwrap();
         pd.transport().feed(&bytes);
-        assert!(pd.poll_once().unwrap());
+        assert!(poll_once_with_test_rng(pd).unwrap());
 
         let reply_bytes: Vec<u8> = pd.transport().outgoing.drain(..).collect();
         let (parsed_reply, _) = ParsedPacket::parse(&reply_bytes).unwrap();
@@ -725,7 +752,7 @@ mod tests {
         let mut pd =
             Pd::new(transport, MockClock::new(), 0x05, AlwaysAck).with_secure_channel(config);
 
-        assert!(pd.poll_once().unwrap());
+        assert!(poll_once_with_test_rng(&mut pd).unwrap());
         let reply_bytes: Vec<u8> = pd.transport().outgoing.drain(..).collect();
         let (parsed, _) = ParsedPacket::parse(&reply_bytes).unwrap();
         assert_eq!(parsed.scb.unwrap().ty, ScsType::Scs12);
@@ -756,7 +783,7 @@ mod tests {
         let mut pd =
             Pd::new(transport, MockClock::new(), 0x05, AlwaysAck).with_secure_channel(config);
 
-        assert!(pd.poll_once().unwrap());
+        assert!(poll_once_with_test_rng(&mut pd).unwrap());
         let reply_bytes: Vec<u8> = pd.transport().outgoing.drain(..).collect();
         let (parsed, _) = ParsedPacket::parse(&reply_bytes).unwrap();
         assert_eq!(parsed.scb.unwrap().ty, ScsType::Scs12);
@@ -782,7 +809,7 @@ mod tests {
         transport.feed(&chlng);
         let mut pd =
             Pd::new(transport, MockClock::new(), 0x05, AlwaysAck).with_secure_channel(config);
-        assert!(pd.poll_once().unwrap());
+        assert!(poll_once_with_test_rng(&mut pd).unwrap());
         let ccrypt_reply: Vec<u8> = pd.transport().outgoing.drain(..).collect();
         let (parsed_ccrypt, _) = ParsedPacket::parse(&ccrypt_reply).unwrap();
         let ccrypt = CCrypt::decode(parsed_ccrypt.data).unwrap();
@@ -792,7 +819,7 @@ mod tests {
         let scrypt_packet =
             secure_command_packet(2, ScsType::Scs13, &Command::SCrypt(scrypt)).unwrap();
         pd.transport().feed(&scrypt_packet);
-        assert!(pd.poll_once().unwrap());
+        assert!(poll_once_with_test_rng(&mut pd).unwrap());
 
         let rmac_reply: Vec<u8> = pd.transport().outgoing.drain(..).collect();
         let (parsed_rmac, _) = ParsedPacket::parse(&rmac_reply).unwrap();
@@ -819,10 +846,6 @@ mod tests {
                     PdSecureKey::ScbkD => Some(SCBK_D),
                 }
             }
-
-            fn secure_channel_random(&mut self) -> Option<[u8; 8]> {
-                Some(TEST_RND_B)
-            }
         }
 
         let config = secure_config();
@@ -834,7 +857,26 @@ mod tests {
         let mut pd =
             Pd::new(transport, MockClock::new(), 0x05, PanicHandler).with_secure_channel(config);
 
-        assert!(pd.poll_once().unwrap());
+        assert!(poll_once_with_test_rng(&mut pd).unwrap());
+    }
+
+    #[cfg(feature = "secure-channel")]
+    #[test]
+    fn secure_challenge_requires_supplied_rng() {
+        let config = secure_config();
+        let bytes =
+            secure_command_packet(1, ScsType::Scs11, &Command::Chlng(Chlng::new([0xA1; 8])))
+                .unwrap();
+        let mut transport = VecTransport::new();
+        transport.feed(&bytes);
+        let mut pd =
+            Pd::new(transport, MockClock::new(), 0x05, AlwaysAck).with_secure_channel(config);
+
+        let err = pd.poll_once().unwrap_err();
+        assert!(matches!(
+            err,
+            Error::Io("secure-channel random unavailable")
+        ));
     }
 
     #[cfg(feature = "secure-channel")]
@@ -853,10 +895,6 @@ mod tests {
                     PdSecureKey::ScbkD => Some(SCBK_D),
                 }
             }
-
-            fn secure_channel_random(&mut self) -> Option<[u8; 8]> {
-                Some(TEST_RND_B)
-            }
         }
 
         let config = secure_config();
@@ -868,7 +906,7 @@ mod tests {
         );
         let mut pd =
             Pd::new(transport, MockClock::new(), 0x05, ExpectId).with_secure_channel(config);
-        assert!(pd.poll_once().unwrap());
+        assert!(poll_once_with_test_rng(&mut pd).unwrap());
         let ccrypt_reply: Vec<u8> = pd.transport().outgoing.drain(..).collect();
         let (parsed_ccrypt, _) = ParsedPacket::parse(&ccrypt_reply).unwrap();
         let ccrypt = CCrypt::decode(parsed_ccrypt.data).unwrap();
@@ -881,7 +919,7 @@ mod tests {
         )
         .unwrap();
         pd.transport().feed(&scrypt_packet);
-        assert!(pd.poll_once().unwrap());
+        assert!(poll_once_with_test_rng(&mut pd).unwrap());
         pd.transport().outgoing.clear();
         let rmac_i = acu.initial_rmac();
         let mut acu = acu.confirm_rmac_i(&rmac_i).unwrap();
@@ -898,7 +936,7 @@ mod tests {
         .unwrap();
         pd.transport().feed(&secure_id);
 
-        assert!(pd.poll_once().unwrap());
+        assert!(poll_once_with_test_rng(&mut pd).unwrap());
         let reply_bytes: Vec<u8> = pd.transport().outgoing.drain(..).collect();
         let (parsed_reply, _) = ParsedPacket::parse(&reply_bytes).unwrap();
         assert_eq!(parsed_reply.scb.unwrap().ty, ScsType::Scs16);
@@ -931,10 +969,6 @@ mod tests {
                     PdSecureKey::ScbkD => Some(SCBK_D),
                 }
             }
-
-            fn secure_channel_random(&mut self) -> Option<[u8; 8]> {
-                Some(TEST_RND_B)
-            }
         }
 
         let config = secure_config();
@@ -946,7 +980,7 @@ mod tests {
         );
         let mut pd =
             Pd::new(transport, MockClock::new(), 0x05, IdReply).with_secure_channel(config);
-        assert!(pd.poll_once().unwrap());
+        assert!(poll_once_with_test_rng(&mut pd).unwrap());
         let ccrypt_reply: Vec<u8> = pd.transport().outgoing.drain(..).collect();
         let (parsed_ccrypt, _) = ParsedPacket::parse(&ccrypt_reply).unwrap();
         let ccrypt = CCrypt::decode(parsed_ccrypt.data).unwrap();
@@ -959,7 +993,7 @@ mod tests {
         )
         .unwrap();
         pd.transport().feed(&scrypt_packet);
-        assert!(pd.poll_once().unwrap());
+        assert!(poll_once_with_test_rng(&mut pd).unwrap());
         pd.transport().outgoing.clear();
         let rmac_i = acu.initial_rmac();
         let mut acu: Session<Secure> = acu.confirm_rmac_i(&rmac_i).unwrap();
@@ -975,7 +1009,7 @@ mod tests {
         )
         .unwrap();
         pd.transport().feed(&secure_id);
-        assert!(pd.poll_once().unwrap());
+        assert!(poll_once_with_test_rng(&mut pd).unwrap());
 
         let reply_bytes: Vec<u8> = pd.transport().outgoing.drain(..).collect();
         let (parsed_reply, _) = ParsedPacket::parse(&reply_bytes).unwrap();
@@ -1022,7 +1056,7 @@ mod tests {
         .unwrap();
         pd.transport().feed(&plaintext_poll);
 
-        let err = pd.poll_once().unwrap_err();
+        let err = poll_once_with_test_rng(&mut pd).unwrap_err();
         assert!(matches!(
             err,
             Error::SecureSession(crate::error::SecureSessionError::NotSecure)
@@ -1049,7 +1083,7 @@ mod tests {
         .unwrap();
         pd.transport().feed(&wrong_direction_poll);
 
-        let err = pd.poll_once().unwrap_err();
+        let err = poll_once_with_test_rng(&mut pd).unwrap_err();
         assert!(matches!(
             err,
             Error::SecureSession(crate::error::SecureSessionError::NotSecure)
@@ -1122,7 +1156,7 @@ mod tests {
         )
         .unwrap();
         pd.transport().feed(&chlng);
-        assert!(pd.poll_once().unwrap());
+        assert!(poll_once_with_test_rng(&mut pd).unwrap());
         let ccrypt_reply: Vec<u8> = pd.transport().outgoing.drain(..).collect();
         let (parsed_ccrypt, _) = ParsedPacket::parse(&ccrypt_reply).unwrap();
         assert_eq!(parsed_ccrypt.scb.unwrap().data, &[1]);
@@ -1137,7 +1171,7 @@ mod tests {
         )
         .unwrap();
         pd.transport().feed(&scrypt);
-        assert!(pd.poll_once().unwrap());
+        assert!(poll_once_with_test_rng(&mut pd).unwrap());
         let rmac_reply: Vec<u8> = pd.transport().outgoing.drain(..).collect();
         let (parsed_rmac, _) = ParsedPacket::parse(&rmac_reply).unwrap();
         assert_eq!(parsed_rmac.scb.unwrap().data, &[1]);
