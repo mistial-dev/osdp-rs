@@ -29,6 +29,20 @@ pub struct Cryptogrammed;
 #[derive(Debug, Clone, Copy)]
 pub struct Secure;
 
+/// A received secure-channel MAC did not verify.
+///
+/// OSDP v2.2 Annex D.1.2 treats a correct CRC with an invalid MAC as lost
+/// encryption synchronization. The secure-channel session is therefore
+/// terminated and the reset [`Session<Disconnected>`] is returned so callers
+/// must perform a fresh SCS-CS handshake before sending more secure traffic.
+#[derive(Debug)]
+pub struct MacVerifyError {
+    /// Reset session retaining only the SCBK needed to start a new handshake.
+    pub session: Session<Disconnected>,
+    /// Verification failure reason.
+    pub error: SecureSessionError,
+}
+
 /// Secure-channel session state.
 ///
 /// The phantom parameter `S` tracks which step of the Annex D.4 handshake
@@ -91,7 +105,7 @@ impl<S> Session<S> {
 
     /// Drop back to [`Disconnected`], wiping all derived material but keeping
     /// the SCBK so the caller can immediately re-handshake.
-    fn reset(mut self) -> Session<Disconnected> {
+    pub(crate) fn reset(mut self) -> Session<Disconnected> {
         Session {
             scbk: core::mem::take(&mut self.scbk),
             rnd_a: [0; 8],
@@ -197,11 +211,12 @@ impl Session<Secure> {
     }
 
     /// Verify a received MAC against our locally-computed value.
+    #[allow(clippy::result_large_err)]
     pub fn verify(
-        &mut self,
+        mut self,
         bytes: &[u8],
         wire_mac: &[u8; crate::packet::MAC_LEN],
-    ) -> Result<(), SecureSessionError> {
+    ) -> Result<Session<Secure>, MacVerifyError> {
         let computed = cbc_mac(
             bytes,
             &self.last_their_mac,
@@ -213,10 +228,17 @@ impl Session<Secure> {
             .unwrap_u8()
             == 0
         {
-            return Err(SecureSessionError::BadCryptogram);
+            // OSDP v2.2 Annex D.1.2 says a correct CRC with an invalid MAC
+            // indicates encryption synchronization has been lost; the secure
+            // session is terminated and session keys are destroyed. Consume
+            // `self` so callers cannot accidentally continue using it.
+            return Err(MacVerifyError {
+                session: self.reset(),
+                error: SecureSessionError::BadCryptogram,
+            });
         }
         self.last_their_mac = computed;
-        Ok(())
+        Ok(self)
     }
 
     /// Borrow the derived session keys (for AES-CBC DATA encryption).
@@ -276,6 +298,32 @@ mod tests {
         let rmac = session.initial_rmac();
         let session = session.confirm_rmac_i(&rmac).unwrap();
         let _ = session.last_other_mac();
+    }
+
+    #[test]
+    fn bad_mac_returns_to_disconnected() {
+        let scbk = crate::secure::SCBK_D;
+        let session = Session::<Disconnected>::new(scbk).challenge([1u8; 8]);
+        let rnd_b = [2u8; 8];
+        let keys = crate::secure::crypto::SessionKeys::derive(&scbk, &[1u8; 8]);
+        let ccrypt = CCrypt {
+            cuid: [3u8; 8],
+            rnd_b,
+            client_cryptogram: crate::secure::crypto::client_cryptogram(
+                &keys.s_enc,
+                &[1u8; 8],
+                &rnd_b,
+            ),
+        };
+        let session = session.receive_ccrypt(&ccrypt).unwrap();
+        let rmac = session.initial_rmac();
+        let session = session.confirm_rmac_i(&rmac).unwrap();
+
+        let err = session
+            .verify(b"message", &[0xFF; crate::packet::MAC_LEN])
+            .unwrap_err();
+        assert_eq!(err.error, SecureSessionError::BadCryptogram);
+        let _restart = err.session.challenge([4u8; 8]);
     }
 
     #[test]

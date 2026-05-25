@@ -9,7 +9,7 @@
 use crate::error::{Error, SecureSessionError};
 use crate::packet::{Address, ControlByte, CtrlFlags, PacketBuilder, ParsedPacket, Scb, ScsType};
 use crate::secure::cipher::{complement_icv, decrypt_data};
-use crate::secure::session::{Secure, Session};
+use crate::secure::session::{Disconnected, Secure, Session};
 use alloc::vec::Vec;
 
 /// What kind of secured frame we're building.
@@ -31,6 +31,18 @@ impl Direction {
             (Self::PdToAcu, true) => ScsType::Scs18,
         }
     }
+}
+
+/// Successful secure-frame unwrap: the advanced session and plaintext DATA.
+pub type UnsealedFrame = (Session<Secure>, Vec<u8>);
+
+/// Failed secure-frame unwrap: the reset session and the failure reason.
+#[derive(Debug)]
+pub struct UnsealError {
+    /// Reset session retaining only the SCBK needed to start a new handshake.
+    pub session: Session<Disconnected>,
+    /// Frame verification or decoding failure.
+    pub error: Error,
 }
 
 /// Build a fully-secured packet (SCB + optional encryption + MAC + trailer).
@@ -83,23 +95,46 @@ pub fn seal(
 ///
 /// The caller is expected to first run [`ParsedPacket::parse`] and verify
 /// that a [`crate::packet::ScsType`] is present and is one of `SCS_15..=18`.
+#[allow(clippy::result_large_err)]
 pub fn unseal(
-    session: &mut Session<Secure>,
+    session: Session<Secure>,
     parsed: &ParsedPacket<'_>,
     raw: &[u8],
-) -> Result<Vec<u8>, Error> {
-    let scb = parsed
-        .scb
-        .ok_or(Error::SecureSession(SecureSessionError::NotSecure))?;
+) -> Result<UnsealedFrame, UnsealError> {
+    let scb = match parsed.scb {
+        Some(scb) => scb,
+        None => {
+            return Err(UnsealError {
+                session: session.reset(),
+                error: Error::SecureSession(SecureSessionError::NotSecure),
+            });
+        }
+    };
     if !scb.ty.has_mac() {
-        return Err(Error::SecureSession(SecureSessionError::NotSecure));
+        return Err(UnsealError {
+            session: session.reset(),
+            error: Error::SecureSession(SecureSessionError::NotSecure),
+        });
     }
     let trailer_len = if parsed.ctrl.use_crc() { 2 } else { 1 };
-    let mac_offset = raw
-        .len()
-        .checked_sub(trailer_len + crate::packet::MAC_LEN)
-        .ok_or(Error::ShortMac)?;
-    let mac_bytes = parsed.mac.ok_or(Error::ShortMac)?;
+    let mac_offset = match raw.len().checked_sub(trailer_len + crate::packet::MAC_LEN) {
+        Some(offset) => offset,
+        None => {
+            return Err(UnsealError {
+                session: session.reset(),
+                error: Error::ShortMac,
+            });
+        }
+    };
+    let mac_bytes = match parsed.mac {
+        Some(mac) => mac,
+        None => {
+            return Err(UnsealError {
+                session: session.reset(),
+                error: Error::ShortMac,
+            });
+        }
+    };
 
     // OSDP v2.2 Annex D.6.1 unwrap steps 2-4 verify the secure message
     // block MAC before decrypting SCS_17/SCS_18 DATA. Keep the pre-
@@ -107,15 +142,26 @@ pub fn unseal(
     // CBC ICV from the last MAC received from the peer; `verify` advances
     // that rolling MAC on success.
     let decrypt_iv = complement_icv(session.last_other_mac());
-    session
+    let session = session
         .verify(&raw[..mac_offset], &mac_bytes)
-        .map_err(Error::from)?;
+        .map_err(|err| UnsealError {
+            session: err.session,
+            error: Error::from(err.error),
+        })?;
     let plaintext = if scb.ty.is_encrypted() {
-        decrypt_data(&session.keys().s_enc, &decrypt_iv, parsed.data).map_err(Error::from)?
+        match decrypt_data(&session.keys().s_enc, &decrypt_iv, parsed.data) {
+            Ok(plaintext) => plaintext,
+            Err(err) => {
+                return Err(UnsealError {
+                    session: session.reset(),
+                    error: Error::from(err),
+                });
+            }
+        }
     } else {
         parsed.data.to_vec()
     };
-    Ok(plaintext)
+    Ok((session, plaintext))
 }
 
 #[cfg(test)]
@@ -168,7 +214,7 @@ mod tests {
 
     #[test]
     fn seal_then_unseal_mac_only() {
-        let (mut acu, mut pd) = handshake_pair();
+        let (mut acu, pd) = handshake_pair();
         let bytes = seal(
             &mut acu,
             Address::pd(0x05).unwrap(),
@@ -180,7 +226,7 @@ mod tests {
         )
         .unwrap();
         let (parsed, _used) = ParsedPacket::parse(&bytes).unwrap();
-        let plain = unseal(&mut pd, &parsed, &bytes).unwrap();
+        let (_pd, plain) = unseal(pd, &parsed, &bytes).unwrap();
         assert!(plain.is_empty());
     }
 
@@ -226,7 +272,7 @@ mod tests {
 
     #[test]
     fn seal_then_unseal_encrypted() {
-        let (mut acu, mut pd) = handshake_pair();
+        let (mut acu, pd) = handshake_pair();
         let payload = b"sensitive command data";
         let bytes = seal(
             &mut acu,
@@ -243,13 +289,13 @@ mod tests {
         assert_eq!(parsed.data.len() % 16, 0);
         assert_ne!(parsed.data, payload);
 
-        let plain = unseal(&mut pd, &parsed, &bytes).unwrap();
+        let (_pd, plain) = unseal(pd, &parsed, &bytes).unwrap();
         assert_eq!(plain, payload);
     }
 
     #[test]
     fn tampered_mac_rejected() {
-        let (mut acu, mut pd) = handshake_pair();
+        let (mut acu, pd) = handshake_pair();
         let mut bytes = seal(
             &mut acu,
             Address::pd(0x05).unwrap(),
@@ -268,13 +314,14 @@ mod tests {
         bytes[n - 2..].copy_from_slice(&crc.to_le_bytes());
 
         let (parsed, _used) = ParsedPacket::parse(&bytes).unwrap();
-        let err = unseal(&mut pd, &parsed, &bytes).unwrap_err();
-        assert!(matches!(err, Error::SecureSession(_)));
+        let err = unseal(pd, &parsed, &bytes).unwrap_err();
+        assert!(matches!(err.error, Error::SecureSession(_)));
+        let _restart = err.session.challenge([0x11; 8]);
     }
 
     #[test]
     fn tampered_encrypted_data_reports_mac_failure_before_padding() {
-        let (mut acu, mut pd) = handshake_pair();
+        let (mut acu, pd) = handshake_pair();
         let mut bytes = seal(
             &mut acu,
             Address::pd(0x05).unwrap(),
@@ -301,9 +348,9 @@ mod tests {
         bytes[n - 2..].copy_from_slice(&crc.to_le_bytes());
 
         let (parsed, _used) = ParsedPacket::parse(&bytes).unwrap();
-        let err = unseal(&mut pd, &parsed, &bytes).unwrap_err();
+        let err = unseal(pd, &parsed, &bytes).unwrap_err();
         assert!(matches!(
-            err,
+            err.error,
             Error::SecureSession(SecureSessionError::BadCryptogram)
         ));
     }

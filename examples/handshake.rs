@@ -51,7 +51,7 @@ fn main() {
     println!("  → SCRYPT (server cryptogram)");
 
     let mut acu = acu.confirm_rmac_i(&initial_rmac).expect("R-MAC matches");
-    let mut pd = pd.confirm_rmac_i(&initial_rmac).expect("R-MAC matches");
+    let pd = pd.confirm_rmac_i(&initial_rmac).expect("R-MAC matches");
     println!("  ← RMAC_I; both ends now Secure");
     let _ = server_crypto;
 
@@ -73,6 +73,6 @@ fn main() {
 
     // PD parses + unseals.
     let (parsed, _used) = ParsedPacket::parse(&sealed).expect("frame parses");
-    let plain = unseal(&mut pd, &parsed, &sealed).expect("MAC verified");
+    let (_pd, plain) = unseal(pd, &parsed, &sealed).expect("MAC verified");
     println!("  ← decrypted payload = {plain:02X?}");
 }
