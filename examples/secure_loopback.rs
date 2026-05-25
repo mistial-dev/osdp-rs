@@ -10,7 +10,7 @@
 use osdp::Error;
 use osdp::clock::SystemClock;
 use osdp::command::{Command, Id, Poll};
-use osdp::driver::acu::{Acu, AcuSecureKey, PdState};
+use osdp::driver::acu::{Acu, AcuSecureKey, AcuSecureKeyMaterial, AcuSecureKeyProvider, PdState};
 use osdp::driver::pd::{Pd, PdHandler, PdSecureConfig, PdSecureKey};
 use osdp::reply::{Ack, PdId, Reply};
 use osdp::secure::{SCBK_D, SecureRandom};
@@ -18,6 +18,8 @@ use osdp::transport::{Transport, VecTransport};
 use std::collections::VecDeque;
 
 struct DemoPd;
+
+struct DemoAcuKeys;
 
 struct FixedRandom([u8; 8]);
 
@@ -47,6 +49,15 @@ impl PdHandler for DemoPd {
             PdSecureKey::ScbkD => Some(SCBK_D),
             PdSecureKey::Scbk => None,
         }
+    }
+}
+
+impl AcuSecureKeyProvider for DemoAcuKeys {
+    fn secure_key_for(&mut self, _pd_addr: u8) -> Option<AcuSecureKeyMaterial> {
+        Some(AcuSecureKeyMaterial {
+            selection: AcuSecureKey::ScbkD,
+            scbk: SCBK_D,
+        })
     }
 }
 
@@ -87,9 +98,10 @@ impl Transport for LoopbackTransport {
 fn main() -> Result<(), Error> {
     let mut acu = Acu::new(LoopbackTransport::new(), SystemClock::new());
     let mut state = PdState::default();
+    let mut keys = DemoAcuKeys;
     let mut rng = FixedRandom([0xA1; 8]);
 
-    acu.establish_secure_channel(0x05, &mut state, AcuSecureKey::ScbkD, SCBK_D, &mut rng)?;
+    acu.establish_secure_channel(0x05, &mut state, &mut keys, &mut rng)?;
     println!(
         "secure channel established; next SQN {}",
         state.next_sqn.value()

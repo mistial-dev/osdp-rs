@@ -166,6 +166,8 @@ pub enum MultipartError {
 pub enum SecureSessionError {
     /// Cryptogram comparison failed.
     BadCryptogram,
+    /// Application did not supply key material for the requested secure session.
+    KeyUnavailable,
     /// Caller attempted to wrap a frame before SCS was fully established.
     NotSecure,
     /// SCS event arrived in a state that does not accept it.

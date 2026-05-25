@@ -176,17 +176,20 @@ match acu.exchange(0x05, &mut pd, &Command::Poll(Poll))? {
 # Ok::<(), osdp::Error>(())
 ```
 
-For the secure-channel walk, see `examples/handshake.rs`. For an end-to-end
-loopback that exercises SQN cycling, see `examples/loopback_poll.rs`.
+For the secure-channel primitive walk, see `examples/handshake.rs`. For public
+ACU/PD secure-channel driver usage, including an ACU-side
+`AcuSecureKeyProvider`, see `examples/secure_loopback.rs`. For an end-to-end
+plaintext loopback that exercises SQN cycling, see `examples/loopback_poll.rs`.
 
 ## Testing
 
 ```sh
-cargo test                              # 173 unit + 14 integration tests
+cargo test                              # unit, integration, and doctest suite
 cargo test --no-default-features        # `no_std` slice still compiles
 cargo clippy --all-targets --all-features
 cargo run --example loopback_poll
 cargo run --example handshake
+cargo run --example secure_loopback --features secure-channel
 ```
 
 ## License
