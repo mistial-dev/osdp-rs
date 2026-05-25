@@ -12,6 +12,19 @@ use crate::reply::{Reply, ReplyCode};
 use crate::transport::Transport;
 use alloc::vec::Vec;
 
+#[cfg(feature = "secure-channel")]
+use crate::command::{Chlng, SCrypt};
+#[cfg(feature = "secure-channel")]
+use crate::packet::{Scb, ScsType};
+#[cfg(feature = "secure-channel")]
+use crate::reply::{CCrypt, RMacI};
+#[cfg(feature = "secure-channel")]
+use crate::secure::{Challenged, Cryptogrammed, Disconnected, Secure, Session};
+#[cfg(not(feature = "secure-channel"))]
+type Scb = ();
+
+type ParsedReply = (ReplyCode, Sqn, Option<Scb>, Vec<u8>);
+
 /// Bytes pulled from the transport per `Transport::read` call. Sized so a
 /// minimal frame fits in a single read but small enough that the stack
 /// footprint stays modest.
@@ -22,6 +35,40 @@ const RX_CHUNK_LEN: usize = 64;
 /// `Error::Timeout`. This stops us from spinning on a non-blocking transport
 /// that has nothing to deliver.
 const MAX_EMPTY_READS: u8 = 4;
+
+/// Secure-channel key selector used in SCS-CS `SEC_BLK_DATA[0]`.
+#[cfg(feature = "secure-channel")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AcuSecureKey {
+    /// Current SCBK selected by `SEC_BLK_DATA[0] == 1`.
+    Scbk,
+    /// Installation default SCBK-D selected by `SEC_BLK_DATA[0] == 0`.
+    ScbkD,
+}
+
+#[cfg(feature = "secure-channel")]
+impl AcuSecureKey {
+    const fn as_scb_data(self) -> [u8; 1] {
+        match self {
+            Self::ScbkD => [0],
+            Self::Scbk => [1],
+        }
+    }
+}
+
+#[cfg(feature = "secure-channel")]
+#[derive(Debug, Clone)]
+enum AcuSecureState {
+    Challenged {
+        session: Session<Challenged>,
+        key: AcuSecureKey,
+    },
+    Cryptogrammed {
+        session: Session<Cryptogrammed>,
+        key: AcuSecureKey,
+    },
+    Secure(Session<Secure>),
+}
 
 /// Per-PD bookkeeping owned by the ACU driver.
 #[derive(Debug, Clone)]
@@ -34,6 +81,8 @@ pub struct PdState {
     pub last_seen_ms: u64,
     /// Strictly true once `last_seen_ms` has been set at least once.
     seen_at_least_once: bool,
+    #[cfg(feature = "secure-channel")]
+    secure_state: Option<AcuSecureState>,
 }
 
 impl Default for PdState {
@@ -43,6 +92,8 @@ impl Default for PdState {
             use_crc: true,
             last_seen_ms: 0,
             seen_at_least_once: false,
+            #[cfg(feature = "secure-channel")]
+            secure_state: None,
         }
     }
 }
@@ -71,6 +122,21 @@ impl PdState {
     /// should be re-discovered from scratch.
     pub fn reset(&mut self) {
         *self = Self::default();
+    }
+
+    /// True once the SCS-CS handshake has completed.
+    #[cfg(feature = "secure-channel")]
+    pub fn is_secure(&self) -> bool {
+        self.secure_session().is_some()
+    }
+
+    /// Borrow the established ACU-side secure session, if present.
+    #[cfg(feature = "secure-channel")]
+    pub fn secure_session(&self) -> Option<&Session<Secure>> {
+        match &self.secure_state {
+            Some(AcuSecureState::Secure(session)) => Some(session),
+            _ => None,
+        }
     }
 }
 
@@ -170,6 +236,152 @@ impl<T: Transport, C: Clock> Acu<T, C> {
         Ok(bytes)
     }
 
+    /// Send SCS_11 / `osdp_CHLNG` and remember the challenged ACU state.
+    ///
+    /// OSDP v2.2 Annex D.1.3.1 uses `SEC_BLK_DATA[0]` to select the SCBK
+    /// (`1`) or SCBK-D (`0`) for this secure-channel connection sequence.
+    #[cfg(feature = "secure-channel")]
+    pub fn send_secure_challenge(
+        &mut self,
+        pd_addr: u8,
+        pd: &mut PdState,
+        key: AcuSecureKey,
+        scbk: [u8; 16],
+        rnd_a: [u8; 8],
+    ) -> Result<Vec<u8>, Error> {
+        let session = Session::<Disconnected>::new(scbk).challenge(rnd_a);
+        let bytes = self.send_secure_handshake_with_sqn(
+            pd_addr,
+            pd.use_crc,
+            pd.next_sqn,
+            ScsType::Scs11,
+            key,
+            &Command::Chlng(Chlng::new(rnd_a)),
+        )?;
+        pd.secure_state = Some(AcuSecureState::Challenged { session, key });
+        Ok(bytes)
+    }
+
+    /// Receive SCS_12 / `osdp_CCRYPT` and verify the PD cryptogram.
+    #[cfg(feature = "secure-channel")]
+    pub fn receive_secure_ccrypt(&mut self, pd: &mut PdState) -> Result<(), Error> {
+        let (reply_code, sqn, scb, data) = self.recv_loop_with_scb()?;
+        self.require_sqn(pd.next_sqn, reply_code, sqn)?;
+        let (session, key) = match pd.secure_state.take() {
+            Some(AcuSecureState::Challenged { session, key }) => (session, key),
+            other => {
+                pd.secure_state = other;
+                return Err(Error::SecureSession(
+                    crate::error::SecureSessionError::BadTransition,
+                ));
+            }
+        };
+        self.require_scb(scb.as_ref(), ScsType::Scs12, key)?;
+        if reply_code != ReplyCode::CCrypt {
+            pd.secure_state = Some(AcuSecureState::Challenged { session, key });
+            return Err(Error::UnknownReply(reply_code.as_byte()));
+        }
+        let ccrypt = CCrypt::decode(&data)?;
+        match session.receive_ccrypt(&ccrypt) {
+            Ok(session) => {
+                pd.secure_state = Some(AcuSecureState::Cryptogrammed { session, key });
+                pd.mark_seen(self.clock.now_ms());
+                pd.bump_sqn();
+                Ok(())
+            }
+            Err((session, err)) => {
+                pd.secure_state = None;
+                let _ = session;
+                Err(Error::from(err))
+            }
+        }
+    }
+
+    /// Send SCS_13 / `osdp_SCRYPT` using the verified PD cryptogram state.
+    #[cfg(feature = "secure-channel")]
+    pub fn send_secure_scrypt(&mut self, pd_addr: u8, pd: &mut PdState) -> Result<Vec<u8>, Error> {
+        let (server_cryptogram, key) = match pd.secure_state.as_ref() {
+            Some(AcuSecureState::Cryptogrammed { session, key }) => {
+                (session.server_cryptogram(), *key)
+            }
+            _ => {
+                return Err(Error::SecureSession(
+                    crate::error::SecureSessionError::BadTransition,
+                ));
+            }
+        };
+        self.send_secure_handshake_with_sqn(
+            pd_addr,
+            pd.use_crc,
+            pd.next_sqn,
+            ScsType::Scs13,
+            key,
+            &Command::SCrypt(SCrypt::new(server_cryptogram)),
+        )
+    }
+
+    /// Receive SCS_14 / `osdp_RMAC_I` and store the established secure state.
+    #[cfg(feature = "secure-channel")]
+    pub fn receive_secure_rmac_i(&mut self, pd: &mut PdState) -> Result<(), Error> {
+        let (reply_code, sqn, scb, data) = self.recv_loop_with_scb()?;
+        self.require_sqn(pd.next_sqn, reply_code, sqn)?;
+        let (session, key) = match pd.secure_state.take() {
+            Some(AcuSecureState::Cryptogrammed { session, key }) => (session, key),
+            other => {
+                pd.secure_state = other;
+                return Err(Error::SecureSession(
+                    crate::error::SecureSessionError::BadTransition,
+                ));
+            }
+        };
+        self.require_scb(scb.as_ref(), ScsType::Scs14, key)?;
+        if reply_code != ReplyCode::RMacI {
+            pd.secure_state = Some(AcuSecureState::Cryptogrammed { session, key });
+            return Err(Error::UnknownReply(reply_code.as_byte()));
+        }
+        let rmac_i = RMacI::decode(&data)?;
+        match session.confirm_rmac_i(&rmac_i.r_mac_i) {
+            Ok(session) => {
+                pd.secure_state = Some(AcuSecureState::Secure(session));
+                pd.mark_seen(self.clock.now_ms());
+                pd.bump_sqn();
+                Ok(())
+            }
+            Err((session, err)) => {
+                pd.secure_state = None;
+                let _ = session;
+                Err(Error::from(err))
+            }
+        }
+    }
+
+    #[cfg(feature = "secure-channel")]
+    fn send_secure_handshake_with_sqn(
+        &mut self,
+        pd_addr: u8,
+        use_crc: bool,
+        sqn: Sqn,
+        scs: ScsType,
+        key: AcuSecureKey,
+        command: &Command,
+    ) -> Result<Vec<u8>, Error> {
+        let addr = Address::pd(pd_addr)?;
+        let mut flags = CtrlFlags::HAS_SCB;
+        if use_crc {
+            flags |= CtrlFlags::USE_CRC;
+        }
+        let bytes = PacketBuilder {
+            addr,
+            ctrl: ControlByte::new(sqn, flags),
+            scb: Some(Scb::new(scs, key.as_scb_data())),
+            code: command.code().as_byte(),
+            data: command.encode_data()?,
+        }
+        .encode()?;
+        self.transport.write_all(&bytes)?;
+        Ok(bytes)
+    }
+
     /// Drain whatever bytes the transport has, then attempt to parse one
     /// reply. Returns `Err(Error::Timeout)` once the per-attempt
     /// reply-delay budget elapses without a complete packet.
@@ -195,10 +407,15 @@ impl<T: Transport, C: Clock> Acu<T, C> {
     /// Returns the parsed reply code, the SQN it carried, and the raw DATA
     /// bytes. SQN policy is left to the caller.
     fn recv_loop(&mut self) -> Result<(ReplyCode, Sqn, Vec<u8>), Error> {
+        let (reply_code, sqn, _scb, data) = self.recv_loop_with_scb()?;
+        Ok((reply_code, sqn, data))
+    }
+
+    fn recv_loop_with_scb(&mut self) -> Result<ParsedReply, Error> {
         let start = self.clock.now_ms();
         let mut empty_reads = 0u8;
         loop {
-            if let Some(packet) = self.try_parse_packet()? {
+            if let Some(packet) = self.try_parse_packet_with_scb()? {
                 return Ok(packet);
             }
             let mut tmp = [0u8; RX_CHUNK_LEN];
@@ -302,25 +519,24 @@ impl<T: Transport, C: Clock> Acu<T, C> {
     /// the ACU sent — so its SQN is not checked.
     fn recv_one_with_sqn(&mut self, expected_sqn: Sqn) -> Result<Reply, Error> {
         let (reply_code, parsed_sqn, data) = self.recv_loop()?;
-        if reply_code != ReplyCode::Busy && parsed_sqn != expected_sqn {
-            return Err(Error::SqnMismatch {
-                expected: expected_sqn.value(),
-                got: parsed_sqn.value(),
-            });
-        }
+        self.require_sqn(expected_sqn, reply_code, parsed_sqn)?;
         Reply::decode(reply_code, &data)
     }
 
-    fn try_parse_packet(&mut self) -> Result<Option<(ReplyCode, Sqn, Vec<u8>)>, Error> {
+    fn try_parse_packet_with_scb(&mut self) -> Result<Option<ParsedReply>, Error> {
         while let Some(som_pos) = self.rx_buf.iter().position(|&b| b == crate::SOM) {
             self.rx_buf.drain(..som_pos);
             match ParsedPacket::parse(&self.rx_buf) {
                 Ok((parsed, used)) => {
                     let code = ReplyCode::from_byte(parsed.code)?;
                     let sqn = parsed.ctrl.sqn;
+                    #[cfg(feature = "secure-channel")]
+                    let scb = parsed.scb.map(Scb::from);
+                    #[cfg(not(feature = "secure-channel"))]
+                    let scb = parsed.scb.map(|_| ());
                     let data = parsed.data.to_vec();
                     self.rx_buf.drain(..used);
-                    return Ok(Some((code, sqn, data)));
+                    return Ok(Some((code, sqn, scb, data)));
                 }
                 Err(Error::Truncated { .. }) => return Ok(None),
                 Err(Error::BadSom(_)) => {
@@ -337,6 +553,37 @@ impl<T: Transport, C: Clock> Acu<T, C> {
         }
         Ok(None)
     }
+
+    fn require_sqn(
+        &self,
+        expected_sqn: Sqn,
+        reply_code: ReplyCode,
+        parsed_sqn: Sqn,
+    ) -> Result<(), Error> {
+        if reply_code != ReplyCode::Busy && parsed_sqn != expected_sqn {
+            return Err(Error::SqnMismatch {
+                expected: expected_sqn.value(),
+                got: parsed_sqn.value(),
+            });
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "secure-channel")]
+    fn require_scb(
+        &self,
+        scb: Option<&Scb>,
+        expected: ScsType,
+        key: AcuSecureKey,
+    ) -> Result<(), Error> {
+        match scb {
+            Some(scb) if scb.ty == expected && scb.data == key.as_scb_data() => Ok(()),
+            Some(scb) => Err(Error::BadSecurityBlock(scb.ty.as_byte())),
+            None => Err(Error::SecureSession(
+                crate::error::SecureSessionError::NotSecure,
+            )),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -345,6 +592,11 @@ mod tests {
     use crate::clock::MockClock;
     use crate::command::Poll;
     use crate::transport::VecTransport;
+
+    #[cfg(feature = "secure-channel")]
+    use crate::driver::pd::{Pd, PdHandler, PdSecureConfig, PdSecureKey};
+    #[cfg(feature = "secure-channel")]
+    use crate::secure::SCBK_D;
 
     #[test]
     fn send_poll_emits_correct_bytes() {
@@ -461,5 +713,48 @@ mod tests {
 
         let outcome = acu.exchange(0x05, &mut pd, &Command::Poll(Poll)).unwrap();
         assert_eq!(outcome, ExchangeOutcome::Busy);
+    }
+
+    #[cfg(feature = "secure-channel")]
+    #[test]
+    fn secure_handshake_round_trips_with_pd_driver() {
+        struct SecurePd;
+        impl PdHandler for SecurePd {
+            fn on_command(&mut self, _command: &Command) -> Reply {
+                Reply::Ack(crate::reply::Ack)
+            }
+
+            fn secure_channel_key(&mut self, selection: PdSecureKey) -> Option<[u8; 16]> {
+                match selection {
+                    PdSecureKey::ScbkD => Some(SCBK_D),
+                    PdSecureKey::Scbk => None,
+                }
+            }
+
+            fn secure_channel_random(&mut self) -> Option<[u8; 8]> {
+                Some([0xB2; 8])
+            }
+        }
+
+        let mut acu = Acu::new(VecTransport::new(), MockClock::new());
+        let mut pd_driver = Pd::new(VecTransport::new(), MockClock::new(), 0x05, SecurePd)
+            .with_secure_channel(PdSecureConfig { cuid: [0xC1; 8] });
+        let mut state = PdState::default();
+
+        acu.send_secure_challenge(0x05, &mut state, AcuSecureKey::ScbkD, SCBK_D, [0xA1; 8])
+            .unwrap();
+        acu.transport().shuffle_to(pd_driver.transport());
+        assert!(pd_driver.poll_once().unwrap());
+        pd_driver.transport().shuffle_to(acu.transport());
+        acu.receive_secure_ccrypt(&mut state).unwrap();
+
+        acu.send_secure_scrypt(0x05, &mut state).unwrap();
+        acu.transport().shuffle_to(pd_driver.transport());
+        assert!(pd_driver.poll_once().unwrap());
+        pd_driver.transport().shuffle_to(acu.transport());
+        acu.receive_secure_rmac_i(&mut state).unwrap();
+
+        assert!(state.is_secure());
+        assert_eq!(state.next_sqn.value(), 2);
     }
 }
