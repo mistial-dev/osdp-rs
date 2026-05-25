@@ -11,7 +11,7 @@ use osdp::Error;
 use osdp::clock::SystemClock;
 use osdp::command::{Command, Id, Poll};
 use osdp::driver::acu::{Acu, AcuSecureKey, AcuSecureKeyMaterial, AcuSecureKeyProvider, PdState};
-use osdp::driver::pd::{Pd, PdHandler, PdSecureConfig, PdSecureKey};
+use osdp::driver::pd::{Pd, PdHandler, PdSecureConfig, PdSecureKey, PdSecureKeyProvider};
 use osdp::reply::{Ack, PdId, Reply};
 use osdp::secure::{SCBK_D, SecureRandom};
 use osdp::transport::{Transport, VecTransport};
@@ -20,6 +20,8 @@ use std::collections::VecDeque;
 struct DemoPd;
 
 struct DemoAcuKeys;
+
+struct DemoPdKeys;
 
 struct FixedRandom([u8; 8]);
 
@@ -43,8 +45,10 @@ impl PdHandler for DemoPd {
             _ => Reply::Ack(Ack),
         }
     }
+}
 
-    fn secure_channel_key(&mut self, selection: PdSecureKey) -> Option<[u8; 16]> {
+impl PdSecureKeyProvider for DemoPdKeys {
+    fn secure_key_for(&mut self, selection: PdSecureKey) -> Option<[u8; 16]> {
         match selection {
             PdSecureKey::ScbkD => Some(SCBK_D),
             PdSecureKey::Scbk => None,
@@ -62,7 +66,7 @@ impl AcuSecureKeyProvider for DemoAcuKeys {
 }
 
 struct LoopbackTransport {
-    pd: Pd<VecTransport, SystemClock, DemoPd>,
+    pd: Pd<VecTransport, SystemClock, DemoPd, DemoPdKeys>,
     rng: FixedRandom,
     incoming: VecDeque<u8>,
 }
@@ -71,7 +75,7 @@ impl LoopbackTransport {
     fn new() -> Self {
         Self {
             pd: Pd::new(VecTransport::new(), SystemClock::new(), 0x05, DemoPd)
-                .with_secure_channel(PdSecureConfig { cuid: [0xC1; 8] }),
+                .with_secure_channel(PdSecureConfig { cuid: [0xC1; 8] }, DemoPdKeys),
             rng: FixedRandom([0xB2; 8]),
             incoming: VecDeque::new(),
         }

@@ -180,6 +180,13 @@ For the secure-channel primitive walk, see `examples/handshake.rs`. For public
 ACU/PD secure-channel driver usage, including an ACU-side
 `AcuSecureKeyProvider`, see `examples/secure_loopback.rs`. For an end-to-end
 plaintext loopback that exercises SQN cycling, see `examples/loopback_poll.rs`.
+For an install-mode `KEYSET` flow, see `examples/secure_keyset.rs`.
+
+Secure-channel key ownership stays in application code. The ACU driver asks an
+`AcuSecureKeyProvider` whether a PD should use SCBK-D or a current SCBK. The PD
+driver asks a `PdSecureKeyProvider` whether the ACU-selected key is available.
+Applications should persist new SCBKs after a successful secure `KEYSET`, exit
+install mode on the PD, and reconnect with the current SCBK.
 
 ## Testing
 
@@ -190,6 +197,7 @@ cargo clippy --all-targets --all-features
 cargo run --example loopback_poll
 cargo run --example handshake
 cargo run --example secure_loopback --features secure-channel
+cargo run --example secure_keyset --features secure-channel
 ```
 
 ## License

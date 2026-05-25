@@ -25,20 +25,9 @@ use crate::secure::{Disconnected, PdChallenged, Secure, SecureRandom, Session, f
 pub trait PdHandler {
     /// Dispatch a fully-decoded command and return the reply payload.
     fn on_command(&mut self, command: &Command) -> Reply;
-
-    /// Return the SCBK requested by the secure-channel handshake.
-    ///
-    /// OSDP v2.2 Annex D.1.3.1 uses `SEC_BLK_DATA[0]` on SCS_11 to select
-    /// the current SCBK (`1`) or SCBK-D (`0`). Key ownership is application
-    /// state, so the PD driver asks the handler instead of storing keys.
-    #[cfg(feature = "secure-channel")]
-    fn secure_channel_key(&mut self, _selection: PdSecureKey) -> Option<[u8; 16]> {
-        None
-    }
 }
 
 /// Secure-channel key selector from SCS handshake `SEC_BLK_DATA[0]`.
-#[cfg(feature = "secure-channel")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PdSecureKey {
     /// Current SCBK selected by `SEC_BLK_DATA[0] == 1`.
@@ -47,8 +36,8 @@ pub enum PdSecureKey {
     ScbkD,
 }
 
-#[cfg(feature = "secure-channel")]
 impl PdSecureKey {
+    #[cfg(feature = "secure-channel")]
     fn from_scb_data(data: &[u8]) -> Result<Self, Error> {
         match data {
             [0] => Ok(Self::ScbkD),
@@ -60,11 +49,31 @@ impl PdSecureKey {
         }
     }
 
+    #[cfg(feature = "secure-channel")]
     const fn as_scb_data(self) -> [u8; 1] {
         match self {
             Self::ScbkD => [0],
             Self::Scbk => [1],
         }
+    }
+}
+
+/// Application-owned PD key policy for secure-channel handshakes.
+///
+/// The PD driver does not store SCBKs or install-mode policy. During SCS_11 it
+/// asks this provider for the key selected by the ACU's `SEC_BLK_DATA[0]`.
+pub trait PdSecureKeyProvider {
+    /// Return key material for `selection`, or `None` to deny SCS-CS startup.
+    fn secure_key_for(&mut self, selection: PdSecureKey) -> Option<[u8; 16]>;
+}
+
+/// Default PD key provider used by plaintext-only [`Pd`] instances.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoPdSecureKeyProvider;
+
+impl PdSecureKeyProvider for NoPdSecureKeyProvider {
+    fn secure_key_for(&mut self, _selection: PdSecureKey) -> Option<[u8; 16]> {
+        None
     }
 }
 
@@ -87,7 +96,8 @@ enum PdSecureState {
 }
 
 /// PD driver.
-pub struct Pd<T: Transport, C: Clock, H: PdHandler> {
+pub struct Pd<T: Transport, C: Clock, H: PdHandler, K: PdSecureKeyProvider = NoPdSecureKeyProvider>
+{
     transport: T,
     #[allow(dead_code)]
     clock: C,
@@ -105,9 +115,11 @@ pub struct Pd<T: Transport, C: Clock, H: PdHandler> {
     secure_config: Option<PdSecureConfig>,
     #[cfg(feature = "secure-channel")]
     secure_state: Option<PdSecureState>,
+    #[cfg_attr(not(feature = "secure-channel"), allow(dead_code))]
+    secure_keys: K,
 }
 
-impl<T: Transport, C: Clock, H: PdHandler> Pd<T, C, H> {
+impl<T: Transport, C: Clock, H: PdHandler> Pd<T, C, H, NoPdSecureKeyProvider> {
     /// New driver.
     pub fn new(transport: T, clock: C, address: u8, handler: H) -> Self {
         Self {
@@ -123,15 +135,32 @@ impl<T: Transport, C: Clock, H: PdHandler> Pd<T, C, H> {
             secure_config: None,
             #[cfg(feature = "secure-channel")]
             secure_state: None,
+            secure_keys: NoPdSecureKeyProvider,
         }
     }
+}
 
+impl<T: Transport, C: Clock, H: PdHandler, K: PdSecureKeyProvider> Pd<T, C, H, K> {
     /// Enable PD-side secure-channel handshake handling.
     #[cfg(feature = "secure-channel")]
-    pub fn with_secure_channel(mut self, config: PdSecureConfig) -> Self {
-        self.secure_config = Some(config);
-        self.secure_state = None;
-        self
+    pub fn with_secure_channel<N: PdSecureKeyProvider>(
+        self,
+        config: PdSecureConfig,
+        secure_keys: N,
+    ) -> Pd<T, C, H, N> {
+        Pd {
+            transport: self.transport,
+            clock: self.clock,
+            address: self.address,
+            use_crc: self.use_crc,
+            handler: self.handler,
+            rx_buf: self.rx_buf,
+            last_sqn: self.last_sqn,
+            last_reply: self.last_reply,
+            secure_config: Some(config),
+            secure_state: None,
+            secure_keys,
+        }
     }
 
     /// Borrow the underlying transport.
@@ -347,11 +376,10 @@ impl<T: Transport, C: Clock, H: PdHandler> Pd<T, C, H> {
                     return Ok(None);
                 };
                 let key_selection = PdSecureKey::from_scb_data(&scb.unwrap().data)?;
-                let Some(scbk) = self.handler.secure_channel_key(key_selection) else {
-                    return Err(Error::MalformedPayload {
-                        code: 0x76,
-                        reason: "secure-channel key unavailable",
-                    });
+                let Some(scbk) = self.secure_keys.secure_key_for(key_selection) else {
+                    return Err(Error::SecureSession(
+                        crate::error::SecureSessionError::KeyUnavailable,
+                    ));
                 };
                 let Some(rng) = rng else {
                     return Err(Error::Io("secure-channel random unavailable"));
@@ -499,25 +527,65 @@ mod tests {
     }
 
     #[cfg(feature = "secure-channel")]
-    fn poll_once_with_test_rng<T: Transport, C: Clock, H: PdHandler>(
-        pd: &mut Pd<T, C, H>,
+    fn poll_once_with_test_rng<T: Transport, C: Clock, H: PdHandler, K: PdSecureKeyProvider>(
+        pd: &mut Pd<T, C, H, K>,
     ) -> Result<bool, Error> {
         let mut rng = FixedRandom(TEST_RND_B);
         pd.poll_once_with_rng(&mut rng)
+    }
+
+    #[cfg(feature = "secure-channel")]
+    #[derive(Clone)]
+    struct FixedPdKeys {
+        scbk: Option<[u8; 16]>,
+        scbk_d: Option<[u8; 16]>,
+    }
+
+    #[cfg(feature = "secure-channel")]
+    impl FixedPdKeys {
+        fn both() -> Self {
+            Self {
+                scbk: Some(TEST_SCBK),
+                scbk_d: Some(SCBK_D),
+            }
+        }
+
+        fn scbk_only() -> Self {
+            Self {
+                scbk: Some(TEST_SCBK),
+                scbk_d: None,
+            }
+        }
+
+        fn scbk_d_only() -> Self {
+            Self {
+                scbk: None,
+                scbk_d: Some(SCBK_D),
+            }
+        }
+
+        fn none() -> Self {
+            Self {
+                scbk: None,
+                scbk_d: None,
+            }
+        }
+    }
+
+    #[cfg(feature = "secure-channel")]
+    impl PdSecureKeyProvider for FixedPdKeys {
+        fn secure_key_for(&mut self, selection: PdSecureKey) -> Option<[u8; 16]> {
+            match selection {
+                PdSecureKey::Scbk => self.scbk,
+                PdSecureKey::ScbkD => self.scbk_d,
+            }
+        }
     }
 
     struct AlwaysAck;
     impl PdHandler for AlwaysAck {
         fn on_command(&mut self, _command: &Command) -> Reply {
             Reply::Ack(Ack)
-        }
-
-        #[cfg(feature = "secure-channel")]
-        fn secure_channel_key(&mut self, selection: PdSecureKey) -> Option<[u8; 16]> {
-            match selection {
-                PdSecureKey::Scbk => Some(TEST_SCBK),
-                PdSecureKey::ScbkD => Some(SCBK_D),
-            }
         }
     }
 
@@ -573,16 +641,17 @@ mod tests {
     #[cfg(feature = "secure-channel")]
     fn secure_pd_with_acu<H: PdHandler>(
         handler: H,
-    ) -> (Pd<VecTransport, MockClock, H>, Session<Secure>) {
-        secure_pd_with_acu_key(handler, PdSecureKey::Scbk, TEST_SCBK)
+    ) -> (Pd<VecTransport, MockClock, H, FixedPdKeys>, Session<Secure>) {
+        secure_pd_with_acu_key(handler, FixedPdKeys::both(), PdSecureKey::Scbk, TEST_SCBK)
     }
 
     #[cfg(feature = "secure-channel")]
-    fn secure_pd_with_acu_key<H: PdHandler>(
+    fn secure_pd_with_acu_key<H: PdHandler, K: PdSecureKeyProvider>(
         handler: H,
+        keys: K,
         key: PdSecureKey,
         scbk: [u8; 16],
-    ) -> (Pd<VecTransport, MockClock, H>, Session<Secure>) {
+    ) -> (Pd<VecTransport, MockClock, H, K>, Session<Secure>) {
         let config = secure_config();
         let rnd_a = [0xA1; 8];
         let acu = Session::<Disconnected>::new(scbk).challenge(rnd_a);
@@ -597,7 +666,7 @@ mod tests {
             .unwrap(),
         );
         let mut pd =
-            Pd::new(transport, MockClock::new(), 0x05, handler).with_secure_channel(config);
+            Pd::new(transport, MockClock::new(), 0x05, handler).with_secure_channel(config, keys);
         assert!(poll_once_with_test_rng(&mut pd).unwrap());
         let ccrypt_reply: Vec<u8> = pd.transport().outgoing.drain(..).collect();
         let (parsed_ccrypt, _) = ParsedPacket::parse(&ccrypt_reply).unwrap();
@@ -629,13 +698,6 @@ mod tests {
         fn on_command(&mut self, _command: &Command) -> Reply {
             self.called.set(true);
             Reply::Ack(Ack)
-        }
-
-        fn secure_channel_key(&mut self, selection: PdSecureKey) -> Option<[u8; 16]> {
-            match selection {
-                PdSecureKey::Scbk => Some(TEST_SCBK),
-                PdSecureKey::ScbkD => Some(SCBK_D),
-            }
         }
     }
 
@@ -700,8 +762,17 @@ mod tests {
                 _ => Reply::Ack(Ack),
             }
         }
+    }
 
-        fn secure_channel_key(&mut self, selection: PdSecureKey) -> Option<[u8; 16]> {
+    #[cfg(feature = "secure-channel")]
+    #[derive(Clone)]
+    struct InstallModeKeys {
+        state: Rc<RefCell<InstallModeState>>,
+    }
+
+    #[cfg(feature = "secure-channel")]
+    impl PdSecureKeyProvider for InstallModeKeys {
+        fn secure_key_for(&mut self, selection: PdSecureKey) -> Option<[u8; 16]> {
             let state = self.state.borrow();
             match selection {
                 PdSecureKey::Scbk => state.scbk,
@@ -712,8 +783,8 @@ mod tests {
     }
 
     #[cfg(feature = "secure-channel")]
-    fn exchange_secure_command<H: PdHandler>(
-        pd: &mut Pd<VecTransport, MockClock, H>,
+    fn exchange_secure_command<H: PdHandler, K: PdSecureKeyProvider>(
+        pd: &mut Pd<VecTransport, MockClock, H, K>,
         mut acu: Session<Secure>,
         sqn: u8,
         command: &Command,
@@ -749,8 +820,8 @@ mod tests {
             secure_command_packet(1, ScsType::Scs11, &Command::Chlng(Chlng::new(rnd_a))).unwrap();
         let mut transport = VecTransport::new();
         transport.feed(&bytes);
-        let mut pd =
-            Pd::new(transport, MockClock::new(), 0x05, AlwaysAck).with_secure_channel(config);
+        let mut pd = Pd::new(transport, MockClock::new(), 0x05, AlwaysAck)
+            .with_secure_channel(config, FixedPdKeys::scbk_only());
 
         assert!(poll_once_with_test_rng(&mut pd).unwrap());
         let reply_bytes: Vec<u8> = pd.transport().outgoing.drain(..).collect();
@@ -780,8 +851,8 @@ mod tests {
         .unwrap();
         let mut transport = VecTransport::new();
         transport.feed(&bytes);
-        let mut pd =
-            Pd::new(transport, MockClock::new(), 0x05, AlwaysAck).with_secure_channel(config);
+        let mut pd = Pd::new(transport, MockClock::new(), 0x05, AlwaysAck)
+            .with_secure_channel(config, FixedPdKeys::scbk_d_only());
 
         assert!(poll_once_with_test_rng(&mut pd).unwrap());
         let reply_bytes: Vec<u8> = pd.transport().outgoing.drain(..).collect();
@@ -798,6 +869,54 @@ mod tests {
 
     #[cfg(feature = "secure-channel")]
     #[test]
+    fn secure_challenge_fails_when_provider_has_no_key() {
+        let config = secure_config();
+        let bytes =
+            secure_command_packet(1, ScsType::Scs11, &Command::Chlng(Chlng::new([0xA1; 8])))
+                .unwrap();
+        let mut transport = VecTransport::new();
+        transport.feed(&bytes);
+        let mut pd = Pd::new(transport, MockClock::new(), 0x05, AlwaysAck)
+            .with_secure_channel(config, FixedPdKeys::none());
+
+        let err = poll_once_with_test_rng(&mut pd).unwrap_err();
+
+        assert!(matches!(
+            err,
+            Error::SecureSession(crate::error::SecureSessionError::KeyUnavailable)
+        ));
+        assert!(pd.transport().outgoing.is_empty());
+    }
+
+    #[cfg(feature = "secure-channel")]
+    #[test]
+    fn secure_challenge_rejects_invalid_key_selector() {
+        let config = secure_config();
+        let bytes = PacketBuilder {
+            addr: Address::pd(0x05).unwrap(),
+            ctrl: ControlByte::new(
+                Sqn::new(1).unwrap(),
+                CtrlFlags::USE_CRC | CtrlFlags::HAS_SCB,
+            ),
+            scb: Some(Scb::new(ScsType::Scs11, [2])),
+            code: CommandCode::Chlng.as_byte(),
+            data: Chlng::new([0xA1; 8]).encode().unwrap(),
+        }
+        .encode()
+        .unwrap();
+        let mut transport = VecTransport::new();
+        transport.feed(&bytes);
+        let mut pd = Pd::new(transport, MockClock::new(), 0x05, AlwaysAck)
+            .with_secure_channel(config, FixedPdKeys::both());
+
+        let err = poll_once_with_test_rng(&mut pd).unwrap_err();
+
+        assert!(matches!(err, Error::MalformedPayload { code: 0x76, .. }));
+        assert!(pd.transport().outgoing.is_empty());
+    }
+
+    #[cfg(feature = "secure-channel")]
+    #[test]
     fn secure_scrypt_replies_with_rmac_i() {
         let config = secure_config();
         let rnd_a = [0xA1; 8];
@@ -807,8 +926,8 @@ mod tests {
             secure_command_packet(1, ScsType::Scs11, &Command::Chlng(Chlng::new(rnd_a))).unwrap();
         let mut transport = VecTransport::new();
         transport.feed(&chlng);
-        let mut pd =
-            Pd::new(transport, MockClock::new(), 0x05, AlwaysAck).with_secure_channel(config);
+        let mut pd = Pd::new(transport, MockClock::new(), 0x05, AlwaysAck)
+            .with_secure_channel(config, FixedPdKeys::scbk_only());
         assert!(poll_once_with_test_rng(&mut pd).unwrap());
         let ccrypt_reply: Vec<u8> = pd.transport().outgoing.drain(..).collect();
         let (parsed_ccrypt, _) = ParsedPacket::parse(&ccrypt_reply).unwrap();
@@ -839,13 +958,6 @@ mod tests {
             fn on_command(&mut self, _command: &Command) -> Reply {
                 panic!("secure handshake must not reach PdHandler")
             }
-
-            fn secure_channel_key(&mut self, selection: PdSecureKey) -> Option<[u8; 16]> {
-                match selection {
-                    PdSecureKey::Scbk => Some(TEST_SCBK),
-                    PdSecureKey::ScbkD => Some(SCBK_D),
-                }
-            }
         }
 
         let config = secure_config();
@@ -854,8 +966,8 @@ mod tests {
                 .unwrap();
         let mut transport = VecTransport::new();
         transport.feed(&bytes);
-        let mut pd =
-            Pd::new(transport, MockClock::new(), 0x05, PanicHandler).with_secure_channel(config);
+        let mut pd = Pd::new(transport, MockClock::new(), 0x05, PanicHandler)
+            .with_secure_channel(config, FixedPdKeys::both());
 
         assert!(poll_once_with_test_rng(&mut pd).unwrap());
     }
@@ -869,8 +981,8 @@ mod tests {
                 .unwrap();
         let mut transport = VecTransport::new();
         transport.feed(&bytes);
-        let mut pd =
-            Pd::new(transport, MockClock::new(), 0x05, AlwaysAck).with_secure_channel(config);
+        let mut pd = Pd::new(transport, MockClock::new(), 0x05, AlwaysAck)
+            .with_secure_channel(config, FixedPdKeys::both());
 
         let err = pd.poll_once().unwrap_err();
         assert!(matches!(
@@ -888,13 +1000,6 @@ mod tests {
                 assert!(matches!(command, Command::Id(Id { reserved: 0 })));
                 Reply::Ack(Ack)
             }
-
-            fn secure_channel_key(&mut self, selection: PdSecureKey) -> Option<[u8; 16]> {
-                match selection {
-                    PdSecureKey::Scbk => Some(TEST_SCBK),
-                    PdSecureKey::ScbkD => Some(SCBK_D),
-                }
-            }
         }
 
         let config = secure_config();
@@ -904,8 +1009,8 @@ mod tests {
         transport.feed(
             &secure_command_packet(1, ScsType::Scs11, &Command::Chlng(Chlng::new(rnd_a))).unwrap(),
         );
-        let mut pd =
-            Pd::new(transport, MockClock::new(), 0x05, ExpectId).with_secure_channel(config);
+        let mut pd = Pd::new(transport, MockClock::new(), 0x05, ExpectId)
+            .with_secure_channel(config, FixedPdKeys::scbk_only());
         assert!(poll_once_with_test_rng(&mut pd).unwrap());
         let ccrypt_reply: Vec<u8> = pd.transport().outgoing.drain(..).collect();
         let (parsed_ccrypt, _) = ParsedPacket::parse(&ccrypt_reply).unwrap();
@@ -962,13 +1067,6 @@ mod tests {
                     firmware: [1, 2, 3],
                 })
             }
-
-            fn secure_channel_key(&mut self, selection: PdSecureKey) -> Option<[u8; 16]> {
-                match selection {
-                    PdSecureKey::Scbk => Some(TEST_SCBK),
-                    PdSecureKey::ScbkD => Some(SCBK_D),
-                }
-            }
         }
 
         let config = secure_config();
@@ -978,8 +1076,8 @@ mod tests {
         transport.feed(
             &secure_command_packet(1, ScsType::Scs11, &Command::Chlng(Chlng::new(rnd_a))).unwrap(),
         );
-        let mut pd =
-            Pd::new(transport, MockClock::new(), 0x05, IdReply).with_secure_channel(config);
+        let mut pd = Pd::new(transport, MockClock::new(), 0x05, IdReply)
+            .with_secure_channel(config, FixedPdKeys::scbk_only());
         assert!(poll_once_with_test_rng(&mut pd).unwrap());
         let ccrypt_reply: Vec<u8> = pd.transport().outgoing.drain(..).collect();
         let (parsed_ccrypt, _) = ParsedPacket::parse(&ccrypt_reply).unwrap();
@@ -1095,8 +1193,12 @@ mod tests {
     #[test]
     fn install_mode_limits_secure_commands_until_keyset() {
         let state = Rc::new(RefCell::new(InstallModeState::default()));
+        let keys = InstallModeKeys {
+            state: state.clone(),
+        };
         let (mut pd, acu) = secure_pd_with_acu_key(
             InstallModeHandler::new(state.clone()),
+            keys,
             PdSecureKey::ScbkD,
             SCBK_D,
         );
@@ -1130,8 +1232,12 @@ mod tests {
     fn keyset_installs_scbk_and_exits_install_mode() {
         let installed_scbk = [0x5Au8; 16];
         let state = Rc::new(RefCell::new(InstallModeState::default()));
+        let keys = InstallModeKeys {
+            state: state.clone(),
+        };
         let (mut pd, acu) = secure_pd_with_acu_key(
             InstallModeHandler::new(state.clone()),
+            keys,
             PdSecureKey::ScbkD,
             SCBK_D,
         );
@@ -1145,6 +1251,21 @@ mod tests {
         assert!(matches!(reply, Reply::Ack(_)));
         assert_eq!(state.borrow().scbk, Some(installed_scbk));
         assert!(!state.borrow().install_mode);
+
+        let denied_scbk_d = secure_command_packet_with_key(
+            0,
+            ScsType::Scs11,
+            PdSecureKey::ScbkD,
+            &Command::Chlng(Chlng::new([0xC2; 8])),
+        )
+        .unwrap();
+        pd.transport().feed(&denied_scbk_d);
+        let err = poll_once_with_test_rng(&mut pd).unwrap_err();
+        assert!(matches!(
+            err,
+            Error::SecureSession(crate::error::SecureSessionError::KeyUnavailable)
+        ));
+        assert!(pd.transport().outgoing.is_empty());
 
         let rnd_a = [0xC3; 8];
         let acu = Session::<Disconnected>::new(installed_scbk).challenge(rnd_a);

@@ -9,13 +9,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- *(driver)* Add PD-side secure-channel handshake handling for SCS_11 through
+  SCS_14, including secure command unsealing, secure reply sealing, and
+  install-mode `KEYSET` support.
+- *(driver)* Add ACU-side secure-channel handshake helpers for SCS_11 through
+  SCS_14 and automatic secure command/reply exchange once a `PdState` is
+  secure.
 - *(driver)* Add ACU-side `AcuSecureKeyProvider` and `AcuSecureKeyMaterial`
   for secure-channel key selection.
+- *(driver)* Add PD-side `PdSecureKeyProvider` for secure-channel key
+  selection.
+- *(driver)* Add `PdState::is_secure` and `PdState::secure_session` accessors
+  for ACU-side secure-channel state.
+- *(secure)* Add PD-side secure-session primitives and secure frame
+  seal/unseal helpers for MAC-only and encrypted secure traffic.
+- *(secure)* Add `SecureRandom` injection points for ACU and PD secure-channel
+  handshakes.
+- *(errors)* Add secure-session errors for missing key material, invalid secure
+  transitions, plaintext DATA in secure frames, and not-yet-secure operations.
+- *(examples)* Add secure loopback and secure `KEYSET` install-mode flows.
 
 ### Changed
 
 - *(driver)* Require ACU secure-channel handshake APIs to obtain SCBK material
   through an `AcuSecureKeyProvider` instead of taking raw key bytes directly.
+- *(driver)* Move PD secure-channel key lookup out of `PdHandler`.
+- *(driver)* Route ACU command exchange through secure frame protection after
+  SCS-CS completes.
+
+### Fixed
+
+- *(secure)* Reject plaintext DATA in production secure frames.
+- *(secure)* Verify secure frame MACs before decrypting encrypted DATA.
+- *(secure)* Reset secure sessions to disconnected state after invalid MACs or
+  cryptograms.
+- *(driver)* Reject inbound plaintext secure DATA and wrong-direction secure
+  replies instead of dispatching them.
 
 ## [0.3.1](https://github.com/Quantumlyy/osdp-rs/compare/v0.3.0...v0.3.1) - 2026-05-09
 

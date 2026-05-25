@@ -751,7 +751,7 @@ mod tests {
     use crate::transport::VecTransport;
 
     #[cfg(feature = "secure-channel")]
-    use crate::driver::pd::{Pd, PdHandler, PdSecureConfig, PdSecureKey};
+    use crate::driver::pd::{Pd, PdHandler, PdSecureConfig, PdSecureKey, PdSecureKeyProvider};
     #[cfg(feature = "secure-channel")]
     use crate::secure::SCBK_D;
     #[cfg(feature = "secure-channel")]
@@ -795,6 +795,40 @@ mod tests {
         AcuSecureKeyMaterial {
             selection: AcuSecureKey::Scbk,
             scbk: TEST_SCBK,
+        }
+    }
+
+    #[cfg(feature = "secure-channel")]
+    #[derive(Clone)]
+    struct FixedPdKeys {
+        scbk: Option<[u8; 16]>,
+        scbk_d: Option<[u8; 16]>,
+    }
+
+    #[cfg(feature = "secure-channel")]
+    impl FixedPdKeys {
+        fn scbk_d_only() -> Self {
+            Self {
+                scbk: None,
+                scbk_d: Some(SCBK_D),
+            }
+        }
+
+        fn both() -> Self {
+            Self {
+                scbk: Some(TEST_SCBK),
+                scbk_d: Some(SCBK_D),
+            }
+        }
+    }
+
+    #[cfg(feature = "secure-channel")]
+    impl PdSecureKeyProvider for FixedPdKeys {
+        fn secure_key_for(&mut self, selection: PdSecureKey) -> Option<[u8; 16]> {
+            match selection {
+                PdSecureKey::Scbk => self.scbk,
+                PdSecureKey::ScbkD => self.scbk_d,
+            }
         }
     }
 
@@ -923,18 +957,14 @@ mod tests {
             fn on_command(&mut self, _command: &Command) -> Reply {
                 Reply::Ack(crate::reply::Ack)
             }
-
-            fn secure_channel_key(&mut self, selection: PdSecureKey) -> Option<[u8; 16]> {
-                match selection {
-                    PdSecureKey::ScbkD => Some(SCBK_D),
-                    PdSecureKey::Scbk => None,
-                }
-            }
         }
 
         let mut acu = Acu::new(VecTransport::new(), MockClock::new());
         let mut pd_driver = Pd::new(VecTransport::new(), MockClock::new(), 0x05, SecurePd)
-            .with_secure_channel(PdSecureConfig { cuid: [0xC1; 8] });
+            .with_secure_channel(
+                PdSecureConfig { cuid: [0xC1; 8] },
+                FixedPdKeys::scbk_d_only(),
+            );
         let mut state = PdState::default();
         let mut keys = FixedAcuKeys(Some(scbk_d_material()));
         let mut acu_rng = FixedRandom([0xA1; 8]);
@@ -974,18 +1004,11 @@ mod tests {
                 _ => Reply::Ack(crate::reply::Ack),
             }
         }
-
-        fn secure_channel_key(&mut self, selection: PdSecureKey) -> Option<[u8; 16]> {
-            match selection {
-                PdSecureKey::ScbkD => Some(SCBK_D),
-                PdSecureKey::Scbk => Some(TEST_SCBK),
-            }
-        }
     }
 
     #[cfg(feature = "secure-channel")]
     struct LoopbackPdTransport {
-        pd: Pd<VecTransport, MockClock, SecurePd>,
+        pd: Pd<VecTransport, MockClock, SecurePd, FixedPdKeys>,
         rng: FixedRandom,
         incoming: VecDeque<u8>,
         writes: Vec<Vec<u8>>,
@@ -997,7 +1020,7 @@ mod tests {
         fn new() -> Self {
             Self {
                 pd: Pd::new(VecTransport::new(), MockClock::new(), 0x05, SecurePd)
-                    .with_secure_channel(PdSecureConfig { cuid: [0xC1; 8] }),
+                    .with_secure_channel(PdSecureConfig { cuid: [0xC1; 8] }, FixedPdKeys::both()),
                 rng: FixedRandom([0xB2; 8]),
                 incoming: VecDeque::new(),
                 writes: Vec::new(),
