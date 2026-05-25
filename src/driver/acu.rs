@@ -259,12 +259,13 @@ impl<T: Transport, C: Clock> Acu<T, C> {
         };
         let mut session = session;
         let data = command.encode_data()?;
+        let encrypt = !data.is_empty();
         let bytes = frame::seal(
             &mut session,
             Address::pd(pd_addr)?,
             sqn,
             frame::Direction::AcuToPd,
-            false,
+            encrypt,
             command.code().as_byte(),
             &data,
         );
@@ -683,7 +684,8 @@ impl<T: Transport, C: Clock> Acu<T, C> {
 mod tests {
     use super::*;
     use crate::clock::MockClock;
-    use crate::command::Poll;
+    use crate::command::{Id, Poll};
+    use crate::reply::PdId;
     use crate::transport::VecTransport;
 
     #[cfg(feature = "secure-channel")]
@@ -858,8 +860,17 @@ mod tests {
 
     #[cfg(feature = "secure-channel")]
     impl PdHandler for SecurePd {
-        fn on_command(&mut self, _command: &Command) -> Reply {
-            Reply::Ack(crate::reply::Ack)
+        fn on_command(&mut self, command: &Command) -> Reply {
+            match command {
+                Command::Id(_) => Reply::PdId(PdId {
+                    vendor_oui: [0x00, 0x06, 0x8E],
+                    model: 0x12,
+                    version: 0x34,
+                    serial: 0xCAFE_BABE,
+                    firmware: [1, 2, 3],
+                }),
+                _ => Reply::Ack(crate::reply::Ack),
+            }
         }
 
         fn secure_channel_key(&mut self, selection: PdSecureKey) -> Option<[u8; 16]> {
@@ -879,6 +890,7 @@ mod tests {
         pd: Pd<VecTransport, MockClock, SecurePd>,
         incoming: VecDeque<u8>,
         writes: Vec<Vec<u8>>,
+        replies: Vec<Vec<u8>>,
     }
 
     #[cfg(feature = "secure-channel")]
@@ -889,11 +901,16 @@ mod tests {
                     .with_secure_channel(PdSecureConfig { cuid: [0xC1; 8] }),
                 incoming: VecDeque::new(),
                 writes: Vec::new(),
+                replies: Vec::new(),
             }
         }
 
         fn last_write(&self) -> &[u8] {
             self.writes.last().unwrap()
+        }
+
+        fn last_reply(&self) -> &[u8] {
+            self.replies.last().unwrap()
         }
     }
 
@@ -903,7 +920,9 @@ mod tests {
             self.writes.push(bytes.to_vec());
             self.pd.transport().feed(bytes);
             self.pd.poll_once()?;
-            self.incoming.extend(self.pd.transport().outgoing.drain(..));
+            let reply: Vec<u8> = self.pd.transport().outgoing.drain(..).collect();
+            self.incoming.extend(reply.iter().copied());
+            self.replies.push(reply);
             Ok(())
         }
 
@@ -945,6 +964,55 @@ mod tests {
         let scb = parsed.scb.unwrap();
         assert_eq!(scb.ty, ScsType::Scs15);
         assert!(parsed.data.is_empty());
+        assert!(parsed.mac.is_some());
+    }
+
+    #[cfg(feature = "secure-channel")]
+    #[test]
+    fn exchange_encrypts_secure_data_frames_after_handshake() {
+        let mut acu = Acu::new(LoopbackPdTransport::new(), MockClock::new());
+        acu.retry = RetryConfig {
+            max_retries: 0,
+            overall_budget_ms: 0,
+        };
+        let mut state = PdState::default();
+
+        acu.send_secure_challenge(0x05, &mut state, AcuSecureKey::ScbkD, SCBK_D, [0xA1; 8])
+            .unwrap();
+        acu.receive_secure_ccrypt(&mut state).unwrap();
+        acu.send_secure_scrypt(0x05, &mut state).unwrap();
+        acu.receive_secure_rmac_i(&mut state).unwrap();
+
+        let outcome = acu
+            .exchange(0x05, &mut state, &Command::Id(Id::standard()))
+            .unwrap();
+        assert_eq!(
+            outcome,
+            ExchangeOutcome::Reply(Reply::PdId(PdId {
+                vendor_oui: [0x00, 0x06, 0x8E],
+                model: 0x12,
+                version: 0x34,
+                serial: 0xCAFE_BABE,
+                firmware: [1, 2, 3],
+            }))
+        );
+        assert_eq!(state.next_sqn.value(), 3);
+
+        let (parsed, _) = ParsedPacket::parse(acu.transport().last_write()).unwrap();
+        let scb = parsed.scb.unwrap();
+        assert_eq!(scb.ty, ScsType::Scs17);
+        assert_ne!(parsed.data, &[0x00]);
+        assert!(parsed.mac.is_some());
+
+        let (parsed, _) = ParsedPacket::parse(acu.transport().last_reply()).unwrap();
+        let scb = parsed.scb.unwrap();
+        assert_eq!(scb.ty, ScsType::Scs18);
+        assert_ne!(
+            parsed.data,
+            &[
+                0x00, 0x06, 0x8E, 0x12, 0x34, 0xBE, 0xBA, 0xFE, 0xCA, 0x01, 0x02, 0x03,
+            ]
+        );
         assert!(parsed.mac.is_some());
     }
 }
