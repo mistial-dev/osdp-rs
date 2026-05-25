@@ -95,6 +95,9 @@ enum PdSecureState {
     Secure(Session<Secure>),
 }
 
+#[cfg(feature = "secure-channel")]
+const SCS14_STATUS_SUCCESS: [u8; 1] = [0x01];
+
 /// PD driver.
 pub struct Pd<T: Transport, C: Clock, H: PdHandler, K: PdSecureKeyProvider = NoPdSecureKeyProvider>
 {
@@ -434,7 +437,10 @@ impl<T: Transport, C: Clock, H: PdHandler, K: PdSecureKeyProvider> Pd<T, C, H, K
                         self.secure_state = Some(PdSecureState::Secure(secure));
                         let bytes = self.encode_reply_with_scb(
                             sqn,
-                            Scb::new(ScsType::Scs14, key_selection.as_scb_data()),
+                            // OSDP v2.2 Annex D.1.3.4 defines SCS_14
+                            // SEC_BLK_DATA[0] as a status byte, not the
+                            // SCS_11/SCS_13 key selector: 0x01 means success.
+                            Scb::new(ScsType::Scs14, SCS14_STATUS_SUCCESS),
                             &Reply::RMacI(rmac_i),
                         )?;
                         Ok(Some(bytes))
@@ -946,6 +952,49 @@ mod tests {
         assert_eq!(parsed_rmac.scb.unwrap().data, &[1]);
         assert_eq!(parsed_rmac.code, 0x78);
 
+        let rmac = RMacI::decode(parsed_rmac.data).unwrap();
+        assert_eq!(rmac.r_mac_i, acu.initial_rmac());
+    }
+
+    #[cfg(feature = "secure-channel")]
+    #[test]
+    fn secure_scrypt_with_scbk_d_replies_with_scs14_success_status() {
+        let config = secure_config();
+        let rnd_a = [0xA1; 8];
+        let acu = Session::<Disconnected>::new(SCBK_D).challenge(rnd_a);
+
+        let chlng = secure_command_packet_with_key(
+            1,
+            ScsType::Scs11,
+            PdSecureKey::ScbkD,
+            &Command::Chlng(Chlng::new(rnd_a)),
+        )
+        .unwrap();
+        let mut transport = VecTransport::new();
+        transport.feed(&chlng);
+        let mut pd = Pd::new(transport, MockClock::new(), 0x05, AlwaysAck)
+            .with_secure_channel(config, FixedPdKeys::scbk_d_only());
+        assert!(poll_once_with_test_rng(&mut pd).unwrap());
+        let ccrypt_reply: Vec<u8> = pd.transport().outgoing.drain(..).collect();
+        let (parsed_ccrypt, _) = ParsedPacket::parse(&ccrypt_reply).unwrap();
+        assert_eq!(parsed_ccrypt.scb.unwrap().data, &[0]);
+        let ccrypt = CCrypt::decode(parsed_ccrypt.data).unwrap();
+        let acu = acu.receive_ccrypt(&ccrypt).unwrap();
+
+        let scrypt = secure_command_packet_with_key(
+            2,
+            ScsType::Scs13,
+            PdSecureKey::ScbkD,
+            &Command::SCrypt(SCrypt::new(acu.server_cryptogram())),
+        )
+        .unwrap();
+        pd.transport().feed(&scrypt);
+        assert!(poll_once_with_test_rng(&mut pd).unwrap());
+
+        let rmac_reply: Vec<u8> = pd.transport().outgoing.drain(..).collect();
+        let (parsed_rmac, _) = ParsedPacket::parse(&rmac_reply).unwrap();
+        assert_eq!(parsed_rmac.scb.unwrap().ty, ScsType::Scs14);
+        assert_eq!(parsed_rmac.scb.unwrap().data, &[1]);
         let rmac = RMacI::decode(parsed_rmac.data).unwrap();
         assert_eq!(rmac.r_mac_i, acu.initial_rmac());
     }

@@ -93,6 +93,9 @@ enum AcuSecureState {
     Secure(Session<Secure>),
 }
 
+#[cfg(feature = "secure-channel")]
+const SCS14_STATUS_SUCCESS: [u8; 1] = [0x01];
+
 /// Per-PD bookkeeping owned by the ACU driver.
 #[derive(Debug, Clone)]
 pub struct PdState {
@@ -414,7 +417,7 @@ impl<T: Transport, C: Clock> Acu<T, C> {
                 ));
             }
         };
-        self.require_scb(scb.as_ref(), ScsType::Scs14, key)?;
+        self.require_scs14_success(scb.as_ref())?;
         if reply_code != ReplyCode::RMacI {
             pd.secure_state = Some(AcuSecureState::Cryptogrammed { session, key });
             return Err(Error::UnknownReply(reply_code.as_byte()));
@@ -723,6 +726,20 @@ impl<T: Transport, C: Clock> Acu<T, C> {
     ) -> Result<(), Error> {
         match scb {
             Some(scb) if scb.ty == expected && scb.data == key.as_scb_data() => Ok(()),
+            Some(scb) => Err(Error::BadSecurityBlock(scb.ty.as_byte())),
+            None => Err(Error::SecureSession(
+                crate::error::SecureSessionError::NotSecure,
+            )),
+        }
+    }
+
+    #[cfg(feature = "secure-channel")]
+    fn require_scs14_success(&self, scb: Option<&Scb>) -> Result<(), Error> {
+        match scb {
+            // OSDP v2.2 Annex D.1.3.4 defines SCS_14 SEC_BLK_DATA[0] as a
+            // status byte, not the SCS_11/SCS_13 key selector: 0x01 means
+            // success and 0xff means the Server Cryptogram was rejected.
+            Some(scb) if scb.ty == ScsType::Scs14 && scb.data == SCS14_STATUS_SUCCESS => Ok(()),
             Some(scb) => Err(Error::BadSecurityBlock(scb.ty.as_byte())),
             None => Err(Error::SecureSession(
                 crate::error::SecureSessionError::NotSecure,
@@ -1181,6 +1198,11 @@ mod tests {
         assert_eq!(scb.data, &[0]);
         let (parsed, _) = ParsedPacket::parse(&writes[1]).unwrap();
         assert_eq!(parsed.scb.unwrap().ty, ScsType::Scs13);
+        let replies = &acu.transport().replies;
+        let (parsed, _) = ParsedPacket::parse(&replies[1]).unwrap();
+        let scb = parsed.scb.unwrap();
+        assert_eq!(scb.ty, ScsType::Scs14);
+        assert_eq!(scb.data, &[1]);
     }
 
     #[cfg(feature = "secure-channel")]
@@ -1202,6 +1224,11 @@ mod tests {
         let (parsed, _) = ParsedPacket::parse(&writes[0]).unwrap();
         let scb = parsed.scb.unwrap();
         assert_eq!(scb.ty, ScsType::Scs11);
+        assert_eq!(scb.data, &[1]);
+        let replies = &acu.transport().replies;
+        let (parsed, _) = ParsedPacket::parse(&replies[1]).unwrap();
+        let scb = parsed.scb.unwrap();
+        assert_eq!(scb.ty, ScsType::Scs14);
         assert_eq!(scb.data, &[1]);
     }
 
