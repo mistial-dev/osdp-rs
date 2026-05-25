@@ -18,7 +18,7 @@ use crate::command::{Chlng, SCrypt};
 #[cfg(feature = "secure-channel")]
 use crate::packet::{Scb, ScsType};
 #[cfg(feature = "secure-channel")]
-use crate::secure::{Disconnected, PdChallenged, Secure, Session};
+use crate::secure::{Disconnected, PdChallenged, Secure, Session, frame};
 
 /// Trait for PD-side application logic. Each incoming command becomes a
 /// method call; the handler returns the reply to emit.
@@ -126,6 +126,8 @@ impl<T: Transport, C: Clock, H: PdHandler> Pd<T, C, H> {
                     let cmd_data = parsed.data.to_vec();
                     #[cfg(feature = "secure-channel")]
                     let scb_ty = parsed.scb.map(|scb| scb.ty);
+                    #[cfg(feature = "secure-channel")]
+                    let raw_packet = self.rx_buf[..used].to_vec();
                     let used_len = used;
                     self.rx_buf.drain(..used_len);
 
@@ -148,6 +150,17 @@ impl<T: Transport, C: Clock, H: PdHandler> Pd<T, C, H> {
                         let _ = self.clock.now_ms();
                         return Ok(true);
                     }
+
+                    #[cfg(feature = "secure-channel")]
+                    let cmd_data = {
+                        let mut data = cmd_data;
+                        if matches!(scb_ty, Some(ScsType::Scs15 | ScsType::Scs17)) {
+                            if let Some(plaintext) = self.unseal_secure_command(&raw_packet)? {
+                                data = plaintext;
+                            }
+                        }
+                        data
+                    };
 
                     let command = Command::decode(code, &cmd_data)?;
                     let reply = self.handler.on_command(&command);
@@ -279,13 +292,40 @@ impl<T: Transport, C: Clock, H: PdHandler> Pd<T, C, H> {
             _ => Ok(None),
         }
     }
+
+    #[cfg(feature = "secure-channel")]
+    fn unseal_secure_command(&mut self, raw: &[u8]) -> Result<Option<Vec<u8>>, Error> {
+        let state = match self.secure_state.take() {
+            Some(PdSecureState::Secure(session)) => session,
+            Some(state) => {
+                self.secure_state = Some(state);
+                return Ok(None);
+            }
+            None => return Ok(None),
+        };
+        let (parsed, _) = ParsedPacket::parse(raw)?;
+        // OSDP v2.2 Annex D.6.1 unwrap requires the receiver to validate the
+        // secure-message MAC before consuming DATA, then decrypt SCS_17 DATA.
+        // On failure, Annex D.1.2 treats synchronization as lost; `unseal`
+        // returns the reset session so the PD can require a fresh SCS-CS flow.
+        match frame::unseal(state, &parsed, raw) {
+            Ok((session, plaintext)) => {
+                self.secure_state = Some(PdSecureState::Secure(session));
+                Ok(Some(plaintext))
+            }
+            Err(err) => {
+                self.secure_state = Some(PdSecureState::Disconnected(err.session));
+                Err(err.error)
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::clock::MockClock;
-    use crate::command::Command;
+    use crate::command::{Command, Id};
     use crate::reply::{Ack, Reply};
     use crate::transport::VecTransport;
 
@@ -293,6 +333,8 @@ mod tests {
     use crate::command::SCrypt;
     #[cfg(feature = "secure-channel")]
     use crate::reply::{CCrypt, RMacI};
+    #[cfg(feature = "secure-channel")]
+    use crate::secure::frame::{Direction, seal};
     #[cfg(feature = "secure-channel")]
     use crate::secure::{SCBK_D, Session};
 
@@ -423,6 +465,59 @@ mod tests {
         transport.feed(&bytes);
         let mut pd =
             Pd::new(transport, MockClock::new(), 0x05, PanicHandler).with_secure_channel(config);
+
+        assert!(pd.poll_once().unwrap());
+    }
+
+    #[cfg(feature = "secure-channel")]
+    #[test]
+    fn secure_encrypted_command_is_unsealed_before_dispatch() {
+        struct ExpectId;
+        impl PdHandler for ExpectId {
+            fn on_command(&mut self, command: &Command) -> Reply {
+                assert!(matches!(command, Command::Id(Id { reserved: 0 })));
+                Reply::Ack(Ack)
+            }
+        }
+
+        let config = secure_config();
+        let rnd_a = [0xA1; 8];
+        let acu = Session::<Disconnected>::new(config.scbk).challenge(rnd_a);
+        let mut transport = VecTransport::new();
+        transport.feed(
+            &secure_command_packet(1, ScsType::Scs11, &Command::Chlng(Chlng::new(rnd_a))).unwrap(),
+        );
+        let mut pd =
+            Pd::new(transport, MockClock::new(), 0x05, ExpectId).with_secure_channel(config);
+        assert!(pd.poll_once().unwrap());
+        let ccrypt_reply: Vec<u8> = pd.transport().outgoing.drain(..).collect();
+        let (parsed_ccrypt, _) = ParsedPacket::parse(&ccrypt_reply).unwrap();
+        let ccrypt = CCrypt::decode(parsed_ccrypt.data).unwrap();
+        let acu = acu.receive_ccrypt(&ccrypt).unwrap();
+
+        let scrypt_packet = secure_command_packet(
+            2,
+            ScsType::Scs13,
+            &Command::SCrypt(SCrypt::new(acu.server_cryptogram())),
+        )
+        .unwrap();
+        pd.transport().feed(&scrypt_packet);
+        assert!(pd.poll_once().unwrap());
+        pd.transport().outgoing.clear();
+        let rmac_i = acu.initial_rmac();
+        let mut acu = acu.confirm_rmac_i(&rmac_i).unwrap();
+
+        let secure_id = seal(
+            &mut acu,
+            Address::pd(0x05).unwrap(),
+            Sqn::new(3).unwrap(),
+            Direction::AcuToPd,
+            true,
+            CommandCode::Id.as_byte(),
+            &Id::standard().encode().unwrap(),
+        )
+        .unwrap();
+        pd.transport().feed(&secure_id);
 
         assert!(pd.poll_once().unwrap());
     }
