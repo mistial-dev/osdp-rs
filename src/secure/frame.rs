@@ -8,6 +8,7 @@
 
 use crate::error::{Error, SecureSessionError};
 use crate::packet::{Address, ControlByte, CtrlFlags, PacketBuilder, ParsedPacket, Scb, ScsType};
+use crate::secure::cipher::{complement_icv, decrypt_data};
 use crate::secure::session::{Secure, Session};
 use alloc::vec::Vec;
 
@@ -90,16 +91,20 @@ pub fn unseal(
         .ok_or(Error::ShortMac)?;
     let mac_bytes = parsed.mac.ok_or(Error::ShortMac)?;
 
-    // Decrypt DATA first, while the rolling-ICV still reflects the *prior*
-    // MAC. `verify` will then advance the chain.
-    let plaintext = if scb.ty.is_encrypted() {
-        session.open_data(parsed.data).map_err(Error::from)?
-    } else {
-        parsed.data.to_vec()
-    };
+    // OSDP v2.2 Annex D.6.1 unwrap steps 2-4 verify the secure message
+    // block MAC before decrypting SCS_17/SCS_18 DATA. Keep the pre-
+    // verification ICV because Annex D.6 wrap step 5 derives encrypted DATA's
+    // CBC ICV from the last MAC received from the peer; `verify` advances
+    // that rolling MAC on success.
+    let decrypt_iv = complement_icv(session.last_other_mac());
     session
         .verify(&raw[..mac_offset], &mac_bytes)
         .map_err(Error::from)?;
+    let plaintext = if scb.ty.is_encrypted() {
+        decrypt_data(&session.keys().s_enc, &decrypt_iv, parsed.data).map_err(Error::from)?
+    } else {
+        parsed.data.to_vec()
+    };
     Ok(plaintext)
 }
 
@@ -215,5 +220,41 @@ mod tests {
         let (parsed, _used) = ParsedPacket::parse(&bytes).unwrap();
         let err = unseal(&mut pd, &parsed, &bytes).unwrap_err();
         assert!(matches!(err, Error::SecureSession(_)));
+    }
+
+    #[test]
+    fn tampered_encrypted_data_reports_mac_failure_before_padding() {
+        let (mut acu, mut pd) = handshake_pair();
+        let mut bytes = seal(
+            &mut acu,
+            Address::pd(0x05).unwrap(),
+            Sqn::new(3).unwrap(),
+            Direction::AcuToPd,
+            true,
+            0x6E,
+            b"sensitive command data",
+        )
+        .unwrap();
+
+        let (parsed, _used) = ParsedPacket::parse(&bytes).unwrap();
+        let data_offset = parsed.data.as_ptr() as usize - bytes.as_ptr() as usize;
+        let data_len = parsed.data.len();
+        let n = bytes.len();
+
+        // Corrupt the final ciphertext block and recompute only the packet
+        // CRC so the packet parser accepts the frame. Per OSDP v2.2 Annex
+        // D.6.1 unwrap steps 2-4, the receiver authenticates the secure
+        // message block before decrypting SCS_17/SCS_18 DATA, so this must
+        // fail as a bad MAC rather than exposing whether padding was valid.
+        bytes[data_offset + data_len - 1] ^= 0x01;
+        let crc = crate::packet::crc16(&bytes[..n - 2]);
+        bytes[n - 2..].copy_from_slice(&crc.to_le_bytes());
+
+        let (parsed, _used) = ParsedPacket::parse(&bytes).unwrap();
+        let err = unseal(&mut pd, &parsed, &bytes).unwrap_err();
+        assert!(matches!(
+            err,
+            Error::SecureSession(SecureSessionError::BadCryptogram)
+        ));
     }
 }
