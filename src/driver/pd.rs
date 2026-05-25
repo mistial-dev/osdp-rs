@@ -203,12 +203,21 @@ impl<T: Transport, C: Clock, H: PdHandler> Pd<T, C, H> {
                     #[cfg(feature = "secure-channel")]
                     let cmd_data = {
                         let mut data = cmd_data;
-                        if matches!(
-                            scb.as_ref().map(|scb| scb.ty),
-                            Some(ScsType::Scs15 | ScsType::Scs17)
-                        ) {
-                            if let Some(plaintext) = self.unseal_secure_command(&raw_packet)? {
-                                data = plaintext;
+                        if self.is_secure_session_established() {
+                            match scb.as_ref().map(|scb| scb.ty) {
+                                Some(ScsType::Scs15 | ScsType::Scs17) => {
+                                    data = self.unseal_secure_command(&raw_packet)?;
+                                }
+                                _ => {
+                                    // OSDP v2.2 Annex D.1.4 requires all
+                                    // post-SCS-CS messages from the ACU to
+                                    // carry SCS_15 or SCS_17. Anything else
+                                    // is unauthenticated traffic and must not
+                                    // reach the application handler.
+                                    return Err(Error::SecureSession(
+                                        crate::error::SecureSessionError::NotSecure,
+                                    ));
+                                }
                             }
                         }
                         data
@@ -393,14 +402,25 @@ impl<T: Transport, C: Clock, H: PdHandler> Pd<T, C, H> {
     }
 
     #[cfg(feature = "secure-channel")]
-    fn unseal_secure_command(&mut self, raw: &[u8]) -> Result<Option<Vec<u8>>, Error> {
+    fn is_secure_session_established(&self) -> bool {
+        matches!(self.secure_state, Some(PdSecureState::Secure(_)))
+    }
+
+    #[cfg(feature = "secure-channel")]
+    fn unseal_secure_command(&mut self, raw: &[u8]) -> Result<Vec<u8>, Error> {
         let state = match self.secure_state.take() {
             Some(PdSecureState::Secure(session)) => session,
             Some(state) => {
                 self.secure_state = Some(state);
-                return Ok(None);
+                return Err(Error::SecureSession(
+                    crate::error::SecureSessionError::NotSecure,
+                ));
             }
-            None => return Ok(None),
+            None => {
+                return Err(Error::SecureSession(
+                    crate::error::SecureSessionError::NotSecure,
+                ));
+            }
         };
         let (parsed, _) = ParsedPacket::parse(raw)?;
         // OSDP v2.2 Annex D.6.1 unwrap requires the receiver to validate the
@@ -410,7 +430,7 @@ impl<T: Transport, C: Clock, H: PdHandler> Pd<T, C, H> {
         match frame::unseal(state, &parsed, raw) {
             Ok((session, plaintext)) => {
                 self.secure_state = Some(PdSecureState::Secure(session));
-                Ok(Some(plaintext))
+                Ok(plaintext)
             }
             Err(err) => {
                 self.secure_state = Some(PdSecureState::Disconnected(err.session));
@@ -436,6 +456,10 @@ mod tests {
     use crate::secure::frame::{Direction, seal, unseal};
     #[cfg(feature = "secure-channel")]
     use crate::secure::{SCBK_D, Secure, Session};
+    #[cfg(feature = "secure-channel")]
+    use core::cell::Cell;
+    #[cfg(feature = "secure-channel")]
+    use std::rc::Rc;
 
     #[cfg(feature = "secure-channel")]
     const TEST_SCBK: [u8; 16] = [0xA5; 16];
@@ -509,6 +533,63 @@ mod tests {
             data: command.encode_data()?,
         }
         .encode()
+    }
+
+    #[cfg(feature = "secure-channel")]
+    fn secure_pd_with_acu<H: PdHandler>(
+        handler: H,
+    ) -> (Pd<VecTransport, MockClock, H>, Session<Secure>) {
+        let config = secure_config();
+        let rnd_a = [0xA1; 8];
+        let acu = Session::<Disconnected>::new(TEST_SCBK).challenge(rnd_a);
+        let mut transport = VecTransport::new();
+        transport.feed(
+            &secure_command_packet(1, ScsType::Scs11, &Command::Chlng(Chlng::new(rnd_a))).unwrap(),
+        );
+        let mut pd =
+            Pd::new(transport, MockClock::new(), 0x05, handler).with_secure_channel(config);
+        assert!(pd.poll_once().unwrap());
+        let ccrypt_reply: Vec<u8> = pd.transport().outgoing.drain(..).collect();
+        let (parsed_ccrypt, _) = ParsedPacket::parse(&ccrypt_reply).unwrap();
+        let ccrypt = CCrypt::decode(parsed_ccrypt.data).unwrap();
+        let acu = acu.receive_ccrypt(&ccrypt).unwrap();
+
+        let scrypt_packet = secure_command_packet(
+            2,
+            ScsType::Scs13,
+            &Command::SCrypt(SCrypt::new(acu.server_cryptogram())),
+        )
+        .unwrap();
+        pd.transport().feed(&scrypt_packet);
+        assert!(pd.poll_once().unwrap());
+        pd.transport().outgoing.clear();
+        let rmac_i = acu.initial_rmac();
+        let acu = acu.confirm_rmac_i(&rmac_i).unwrap();
+        (pd, acu)
+    }
+
+    #[cfg(feature = "secure-channel")]
+    struct RecordingHandler {
+        called: Rc<Cell<bool>>,
+    }
+
+    #[cfg(feature = "secure-channel")]
+    impl PdHandler for RecordingHandler {
+        fn on_command(&mut self, _command: &Command) -> Reply {
+            self.called.set(true);
+            Reply::Ack(Ack)
+        }
+
+        fn secure_channel_key(&mut self, selection: PdSecureKey) -> Option<[u8; 16]> {
+            match selection {
+                PdSecureKey::Scbk => Some(TEST_SCBK),
+                PdSecureKey::ScbkD => Some(SCBK_D),
+            }
+        }
+
+        fn secure_channel_random(&mut self) -> Option<[u8; 8]> {
+            Some(TEST_RND_B)
+        }
     }
 
     #[cfg(feature = "secure-channel")]
@@ -801,5 +882,57 @@ mod tests {
             })
         ));
         let _ = acu;
+    }
+
+    #[cfg(feature = "secure-channel")]
+    #[test]
+    fn secure_session_rejects_plaintext_command_without_dispatch() {
+        let called = Rc::new(Cell::new(false));
+        let (mut pd, _acu) = secure_pd_with_acu(RecordingHandler {
+            called: called.clone(),
+        });
+        let plaintext_poll = PacketBuilder::plain(
+            Address::pd(0x05).unwrap(),
+            ControlByte::new(Sqn::new(3).unwrap(), CtrlFlags::USE_CRC),
+            CommandCode::Poll.as_byte(),
+            Vec::new(),
+        )
+        .encode()
+        .unwrap();
+        pd.transport().feed(&plaintext_poll);
+
+        let err = pd.poll_once().unwrap_err();
+        assert!(matches!(
+            err,
+            Error::SecureSession(crate::error::SecureSessionError::NotSecure)
+        ));
+        assert!(!called.get());
+    }
+
+    #[cfg(feature = "secure-channel")]
+    #[test]
+    fn secure_session_rejects_reply_direction_scb_without_dispatch() {
+        let called = Rc::new(Cell::new(false));
+        let (mut pd, mut acu) = secure_pd_with_acu(RecordingHandler {
+            called: called.clone(),
+        });
+        let wrong_direction_poll = seal(
+            &mut acu,
+            Address::pd(0x05).unwrap(),
+            Sqn::new(3).unwrap(),
+            Direction::PdToAcu,
+            false,
+            CommandCode::Poll.as_byte(),
+            &[],
+        )
+        .unwrap();
+        pd.transport().feed(&wrong_direction_poll);
+
+        let err = pd.poll_once().unwrap_err();
+        assert!(matches!(
+            err,
+            Error::SecureSession(crate::error::SecureSessionError::NotSecure)
+        ));
+        assert!(!called.get());
     }
 }
