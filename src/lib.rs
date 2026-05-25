@@ -48,7 +48,8 @@
 //! ```
 //!
 //! For the secure-channel walk see `examples/handshake.rs`; for an end-to-end
-//! loopback that exercises SQN cycling see `examples/loopback_poll.rs`.
+//! plaintext loopback that exercises SQN cycling see `examples/loopback_poll.rs`.
+//! For a public ACU/PD secure-channel loopback, see `examples/secure_loopback.rs`.
 //!
 //! # Specification cross-references
 //!

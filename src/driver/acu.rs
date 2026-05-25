@@ -394,6 +394,28 @@ impl<T: Transport, C: Clock> Acu<T, C> {
         }
     }
 
+    /// Run the ACU side of the SCS-CS handshake through SCS_11..SCS_14.
+    ///
+    /// This is a convenience wrapper around the four explicit handshake
+    /// methods for transports that can synchronously deliver each PD reply
+    /// between ACU writes. Event-loop style integrations can continue to call
+    /// the individual steps directly. OSDP v2.2 Annex D.1.3 defines this
+    /// order: CHLNG, CCRYPT, SCRYPT, then RMAC_I.
+    #[cfg(feature = "secure-channel")]
+    pub fn establish_secure_channel(
+        &mut self,
+        pd_addr: u8,
+        pd: &mut PdState,
+        key: AcuSecureKey,
+        scbk: [u8; 16],
+        rnd_a: [u8; 8],
+    ) -> Result<(), Error> {
+        self.send_secure_challenge(pd_addr, pd, key, scbk, rnd_a)?;
+        self.receive_secure_ccrypt(pd)?;
+        self.send_secure_scrypt(pd_addr, pd)?;
+        self.receive_secure_rmac_i(pd)
+    }
+
     #[cfg(feature = "secure-channel")]
     fn send_secure_handshake_with_sqn(
         &mut self,
@@ -940,14 +962,31 @@ mod tests {
         let mut acu = Acu::new(LoopbackPdTransport::new(), MockClock::new());
         let mut state = PdState::default();
 
-        acu.send_secure_challenge(0x05, &mut state, AcuSecureKey::ScbkD, SCBK_D, [0xA1; 8])
+        acu.establish_secure_channel(0x05, &mut state, AcuSecureKey::ScbkD, SCBK_D, [0xA1; 8])
             .unwrap();
-        acu.receive_secure_ccrypt(&mut state).unwrap();
-        acu.send_secure_scrypt(0x05, &mut state).unwrap();
-        acu.receive_secure_rmac_i(&mut state).unwrap();
 
         assert!(state.is_secure());
         state
+    }
+
+    #[cfg(feature = "secure-channel")]
+    #[test]
+    fn establish_secure_channel_runs_full_handshake() {
+        let mut acu = Acu::new(LoopbackPdTransport::new(), MockClock::new());
+        let mut state = PdState::default();
+
+        acu.establish_secure_channel(0x05, &mut state, AcuSecureKey::ScbkD, SCBK_D, [0xA1; 8])
+            .unwrap();
+
+        assert!(state.is_secure());
+        assert_eq!(state.next_sqn.value(), 2);
+
+        let writes = &acu.transport().writes;
+        assert_eq!(writes.len(), 2);
+        let (parsed, _) = ParsedPacket::parse(&writes[0]).unwrap();
+        assert_eq!(parsed.scb.unwrap().ty, ScsType::Scs11);
+        let (parsed, _) = ParsedPacket::parse(&writes[1]).unwrap();
+        assert_eq!(parsed.scb.unwrap().ty, ScsType::Scs13);
     }
 
     #[cfg(feature = "secure-channel")]
@@ -960,11 +999,8 @@ mod tests {
         };
         let mut state = PdState::default();
 
-        acu.send_secure_challenge(0x05, &mut state, AcuSecureKey::ScbkD, SCBK_D, [0xA1; 8])
+        acu.establish_secure_channel(0x05, &mut state, AcuSecureKey::ScbkD, SCBK_D, [0xA1; 8])
             .unwrap();
-        acu.receive_secure_ccrypt(&mut state).unwrap();
-        acu.send_secure_scrypt(0x05, &mut state).unwrap();
-        acu.receive_secure_rmac_i(&mut state).unwrap();
 
         let outcome = acu
             .exchange(0x05, &mut state, &Command::Poll(Poll))
@@ -992,11 +1028,8 @@ mod tests {
         };
         let mut state = PdState::default();
 
-        acu.send_secure_challenge(0x05, &mut state, AcuSecureKey::ScbkD, SCBK_D, [0xA1; 8])
+        acu.establish_secure_channel(0x05, &mut state, AcuSecureKey::ScbkD, SCBK_D, [0xA1; 8])
             .unwrap();
-        acu.receive_secure_ccrypt(&mut state).unwrap();
-        acu.send_secure_scrypt(0x05, &mut state).unwrap();
-        acu.receive_secure_rmac_i(&mut state).unwrap();
 
         let outcome = acu
             .exchange(0x05, &mut state, &Command::Id(Id::standard()))
