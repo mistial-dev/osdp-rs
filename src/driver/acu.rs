@@ -576,17 +576,25 @@ impl<T: Transport, C: Clock> Acu<T, C> {
         let max = self.retry.max_retries;
         let budget = self.retry.overall_budget_ms;
         let mut request: Option<Vec<u8>> = None;
+        #[cfg(feature = "secure-channel")]
+        let mut secure_request_sent = false;
 
         loop {
             if let Some(bytes) = request.as_ref() {
                 self.transport.write_all(bytes)?;
             } else {
                 #[cfg(feature = "secure-channel")]
-                let bytes = if pd.is_secure() {
+                let secure_send = pd.is_secure();
+                #[cfg(feature = "secure-channel")]
+                let bytes = if secure_send {
                     self.send_secure_with_sqn(pd_addr, pd, sqn, command)?
                 } else {
                     self.send_with_sqn(pd_addr, pd.use_crc, sqn, command)?
                 };
+                #[cfg(feature = "secure-channel")]
+                {
+                    secure_request_sent = secure_send;
+                }
                 #[cfg(not(feature = "secure-channel"))]
                 let bytes = self.send_with_sqn(pd_addr, pd.use_crc, sqn, command)?;
                 request = Some(bytes);
@@ -607,12 +615,24 @@ impl<T: Transport, C: Clock> Acu<T, C> {
                     attempts += 1;
                     let now = self.clock.now_ms();
                     if pd.is_offline(now) {
+                        #[cfg(feature = "secure-channel")]
+                        if secure_request_sent {
+                            Self::reset_secure_after_exhausted_timeout(pd);
+                        }
                         return Ok(ExchangeOutcome::Offline);
                     }
                     if attempts > max {
+                        #[cfg(feature = "secure-channel")]
+                        if secure_request_sent {
+                            Self::reset_secure_after_exhausted_timeout(pd);
+                        }
                         return Ok(ExchangeOutcome::Timeout);
                     }
                     if budget != 0 && now.saturating_sub(started) >= budget as u64 {
+                        #[cfg(feature = "secure-channel")]
+                        if secure_request_sent {
+                            Self::reset_secure_after_exhausted_timeout(pd);
+                        }
                         return Ok(ExchangeOutcome::Timeout);
                     }
                     // Re-loop with the SAME SQN to ask for a reply repeat.
@@ -621,6 +641,16 @@ impl<T: Transport, C: Clock> Acu<T, C> {
                 Err(other) => return Err(other),
             }
         }
+    }
+
+    #[cfg(feature = "secure-channel")]
+    fn reset_secure_after_exhausted_timeout(pd: &mut PdState) {
+        // OSDP v2.2 D.1.2 terminates the secure session and destroys session
+        // keys when encryption synchronization is lost; it also allows either
+        // party to terminate by forcing a timeout. D.7 says an ACU that
+        // identifies a secure-session issue should reset and initiate a new
+        // osdp_CHLNG/SCS_11 sequence.
+        pd.secure_state = None;
     }
 
     /// Same as [`Self::receive`] but without mutating any [`PdState`] (used
@@ -1075,6 +1105,47 @@ mod tests {
     }
 
     #[cfg(feature = "secure-channel")]
+    struct SilentTransport {
+        writes: Vec<Vec<u8>>,
+        clock: Option<MockClock>,
+        advance_to_ms: u64,
+    }
+
+    #[cfg(feature = "secure-channel")]
+    impl SilentTransport {
+        fn new() -> Self {
+            Self {
+                writes: Vec::new(),
+                clock: None,
+                advance_to_ms: 0,
+            }
+        }
+
+        fn advancing(clock: MockClock, advance_to_ms: u64) -> Self {
+            Self {
+                writes: Vec::new(),
+                clock: Some(clock),
+                advance_to_ms,
+            }
+        }
+    }
+
+    #[cfg(feature = "secure-channel")]
+    impl Transport for SilentTransport {
+        fn write_all(&mut self, bytes: &[u8]) -> Result<(), Error> {
+            self.writes.push(bytes.to_vec());
+            Ok(())
+        }
+
+        fn read(&mut self, _buf: &mut [u8]) -> Result<usize, Error> {
+            if let Some(clock) = self.clock.take() {
+                clock.set(self.advance_to_ms);
+            }
+            Ok(0)
+        }
+    }
+
+    #[cfg(feature = "secure-channel")]
     fn establish_secure_state() -> PdState {
         let mut acu = Acu::new(LoopbackPdTransport::new(), MockClock::new());
         let mut state = PdState::default();
@@ -1271,6 +1342,45 @@ mod tests {
 
         assert!(matches!(outcome, ExchangeOutcome::Reply(Reply::PdId(_))));
         assert_eq!(state.next_sqn.value(), 1);
+    }
+
+    #[cfg(feature = "secure-channel")]
+    #[test]
+    fn secure_exchange_timeout_resets_secure_state() {
+        let mut state = establish_secure_state();
+        let mut acu = Acu::new(SilentTransport::new(), MockClock::new());
+        acu.retry = RetryConfig {
+            max_retries: 0,
+            overall_budget_ms: 0,
+        };
+
+        let outcome = acu
+            .exchange(0x05, &mut state, &Command::Poll(Poll))
+            .unwrap();
+
+        assert_eq!(outcome, ExchangeOutcome::Timeout);
+        assert!(!state.is_secure());
+    }
+
+    #[cfg(feature = "secure-channel")]
+    #[test]
+    fn secure_exchange_offline_after_send_resets_secure_state() {
+        let mut state = establish_secure_state();
+        let clock = MockClock::new();
+        let transport =
+            SilentTransport::advancing(clock.clone(), crate::OFFLINE_THRESHOLD_MS as u64);
+        let mut acu = Acu::new(transport, clock);
+        acu.retry = RetryConfig {
+            max_retries: 0,
+            overall_budget_ms: 0,
+        };
+
+        let outcome = acu
+            .exchange(0x05, &mut state, &Command::Poll(Poll))
+            .unwrap();
+
+        assert_eq!(outcome, ExchangeOutcome::Offline);
+        assert!(!state.is_secure());
     }
 
     #[cfg(feature = "secure-channel")]
