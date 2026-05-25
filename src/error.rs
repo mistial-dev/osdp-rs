@@ -172,6 +172,8 @@ pub enum SecureSessionError {
     BadTransition,
     /// Encrypted DATA must be padded to a 16-byte multiple.
     BadPadding,
+    /// Production secure frames must not carry plaintext DATA.
+    PlaintextDataNotAllowed,
 }
 
 impl fmt::Display for Error {

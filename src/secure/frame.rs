@@ -48,6 +48,16 @@ pub fn seal(
     data: &[u8],
 ) -> Result<Vec<u8>, Error> {
     let ty = direction.scs_for(encrypt);
+    if !encrypt && !data.is_empty() {
+        // OSDP v2.2 Annex D.1.4.1/D.1.5 permit SCS_15/SCS_16 plaintext
+        // DATA only for testing; normal production use should reject it. The
+        // high-level frame helper is the production-safe path, so callers that
+        // need test vectors must construct those packets at the lower packet
+        // layer explicitly.
+        return Err(Error::SecureSession(
+            SecureSessionError::PlaintextDataNotAllowed,
+        ));
+    }
     let scb = Scb::new(ty, []);
     let payload: Vec<u8> = if encrypt {
         session.seal_data(data)
@@ -172,6 +182,46 @@ mod tests {
         let (parsed, _used) = ParsedPacket::parse(&bytes).unwrap();
         let plain = unseal(&mut pd, &parsed, &bytes).unwrap();
         assert!(plain.is_empty());
+    }
+
+    #[test]
+    fn seal_rejects_plaintext_command_data() {
+        let (mut acu, _pd) = handshake_pair();
+        let err = seal(
+            &mut acu,
+            Address::pd(0x05).unwrap(),
+            Sqn::new(1).unwrap(),
+            Direction::AcuToPd,
+            false,
+            0x6E,
+            b"plaintext command data",
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            Error::SecureSession(SecureSessionError::PlaintextDataNotAllowed)
+        ));
+    }
+
+    #[test]
+    fn seal_rejects_plaintext_reply_data() {
+        let (_acu, mut pd) = handshake_pair();
+        let err = seal(
+            &mut pd,
+            Address::pd(0x05).unwrap(),
+            Sqn::new(1).unwrap(),
+            Direction::PdToAcu,
+            false,
+            0x45,
+            b"plaintext reply data",
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            Error::SecureSession(SecureSessionError::PlaintextDataNotAllowed)
+        ));
     }
 
     #[test]
