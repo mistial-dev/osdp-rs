@@ -936,6 +936,21 @@ mod tests {
     }
 
     #[cfg(feature = "secure-channel")]
+    fn establish_secure_state() -> PdState {
+        let mut acu = Acu::new(LoopbackPdTransport::new(), MockClock::new());
+        let mut state = PdState::default();
+
+        acu.send_secure_challenge(0x05, &mut state, AcuSecureKey::ScbkD, SCBK_D, [0xA1; 8])
+            .unwrap();
+        acu.receive_secure_ccrypt(&mut state).unwrap();
+        acu.send_secure_scrypt(0x05, &mut state).unwrap();
+        acu.receive_secure_rmac_i(&mut state).unwrap();
+
+        assert!(state.is_secure());
+        state
+    }
+
+    #[cfg(feature = "secure-channel")]
     #[test]
     fn exchange_uses_mac_only_secure_frames_after_handshake() {
         let mut acu = Acu::new(LoopbackPdTransport::new(), MockClock::new());
@@ -1014,5 +1029,65 @@ mod tests {
             ]
         );
         assert!(parsed.mac.is_some());
+    }
+
+    #[cfg(feature = "secure-channel")]
+    #[test]
+    fn exchange_rejects_plaintext_reply_after_handshake() {
+        let mut state = establish_secure_state();
+        let mut transport = VecTransport::new();
+        let plaintext_reply = PacketBuilder::plain(
+            Address::reply(0x05).unwrap(),
+            ControlByte::new(state.next_sqn, CtrlFlags::USE_CRC),
+            ReplyCode::Ack.as_byte(),
+            Vec::new(),
+        )
+        .encode()
+        .unwrap();
+        transport.feed(&plaintext_reply);
+        let mut acu = Acu::new(transport, MockClock::new());
+        acu.retry = RetryConfig {
+            max_retries: 0,
+            overall_budget_ms: 0,
+        };
+
+        let err = acu
+            .exchange(0x05, &mut state, &Command::Poll(Poll))
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            Error::SecureSession(crate::error::SecureSessionError::NotSecure)
+        ));
+        assert!(!state.is_secure());
+    }
+
+    #[cfg(feature = "secure-channel")]
+    #[test]
+    fn exchange_rejects_wrong_direction_secure_reply_after_handshake() {
+        let mut state = establish_secure_state();
+        let mut transport = VecTransport::new();
+        let wrong_direction_reply = PacketBuilder {
+            addr: Address::reply(0x05).unwrap(),
+            ctrl: ControlByte::new(state.next_sqn, CtrlFlags::USE_CRC | CtrlFlags::HAS_SCB),
+            scb: Some(Scb::new(ScsType::Scs15, [])),
+            code: ReplyCode::Ack.as_byte(),
+            data: Vec::new(),
+        }
+        .encode_with_mac(|_| [0u8; crate::packet::MAC_LEN])
+        .unwrap();
+        transport.feed(&wrong_direction_reply);
+        let mut acu = Acu::new(transport, MockClock::new());
+        acu.retry = RetryConfig {
+            max_retries: 0,
+            overall_budget_ms: 0,
+        };
+
+        let err = acu
+            .exchange(0x05, &mut state, &Command::Poll(Poll))
+            .unwrap_err();
+
+        assert!(matches!(err, Error::BadSecurityBlock(0x15)));
+        assert!(!state.is_secure());
     }
 }
